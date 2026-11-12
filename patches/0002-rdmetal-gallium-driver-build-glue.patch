@@ -1,0 +1,311 @@
+diff --git a/include/GL/internal/mesa_interface.h b/include/GL/internal/mesa_interface.h
+index a565094..e1d3de7 100644
+--- a/include/GL/internal/mesa_interface.h
++++ b/include/GL/internal/mesa_interface.h
+@@ -45,8 +45,14 @@ struct __DRImesaCoreExtensionRec {
+ 
+    /* Version string for verifying that the DRI driver is from the same build as
+     * the loader.
++    *
++    * The rdmetal driver is cross-loaded by the guest's stock Alpine Mesa
++    * loaders (libEGL/libgbm 24.0.9), whose interface version is the bare
++    * release string "24.0.9".  Do not append MESA_GIT_SHA1 here: the guest
++    * loader rejects any driver whose version_string differs, so a git-suffixed
++    * string would fail the "DRI driver not from this Mesa build" ABI check.
+     */
+-#define MESA_INTERFACE_VERSION_STRING PACKAGE_VERSION MESA_GIT_SHA1
++#define MESA_INTERFACE_VERSION_STRING PACKAGE_VERSION
+    const char *version_string;
+ 
+    /* Screen creation function regardless of DRI2, image, or swrast backend.
+diff --git a/meson_options.txt b/meson_options.txt
+index 500a2eb..1b1373c 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -682,4 +682,11 @@ option(
+   description : 'Build custom xmlconfig (driconf) support. If disabled, ' +
+                 'the default driconf file is hardcoded into Mesa. ' +
+                 'Requires expat.'
+-)
+\ No newline at end of file
++)
++
++option(
++  'rdmetal-image-candidate',
++  type : 'boolean',
++  value : false,
++  description : 'Build isolated rdmetal Wayland image-loader candidate (fails closed without broker winsys).'
++)
+diff --git a/src/gallium/auxiliary/target-helpers/sw_helper.h b/src/gallium/auxiliary/target-helpers/sw_helper.h
+index 65fadc4..807e933 100644
+--- a/src/gallium/auxiliary/target-helpers/sw_helper.h
++++ b/src/gallium/auxiliary/target-helpers/sw_helper.h
+@@ -22,6 +22,7 @@
+ 
+ #ifdef GALLIUM_SOFTPIPE
+ #include "softpipe/sp_public.h"
++#include "rdmetal/rdmetal_screen.h"
+ #endif
+ 
+ #ifdef GALLIUM_LLVMPIPE
+@@ -52,6 +53,9 @@ sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config
+ #endif
+ 
+ #if defined(GALLIUM_SOFTPIPE)
++   if (screen == NULL && strcmp(driver, "rdmetal") == 0)
++      screen = rdmetal_create_screen(winsys);
++
+    if (screen == NULL && strcmp(driver, "softpipe") == 0)
+       screen = softpipe_create_screen(winsys);
+ #endif
+@@ -82,6 +86,12 @@ sw_screen_create_vk(struct sw_winsys *winsys, const struct pipe_screen_config *c
+       "llvmpipe",
+ #endif
+ #if defined(GALLIUM_SOFTPIPE)
++      /* rdmetal wraps softpipe (delegates every path the broker-backed Metal
++       * resource does not own), so it is a safe DEFAULT ahead of plain
++       * softpipe: with no GALLIUM_DRIVER set the software-winsys loader now
++       * selects rdmetal, and rdmetal_create_screen() still falls back to the
++       * softpipe implementation underneath. */
++      sw_vk ? "" : "rdmetal",
+       sw_vk ? "" : "softpipe",
+ #endif
+    };
+diff --git a/src/gallium/drivers/softpipe/meson.build b/src/gallium/drivers/softpipe/meson.build
+index e3bdf7e..9e8a44a 100644
+--- a/src/gallium/drivers/softpipe/meson.build
++++ b/src/gallium/drivers/softpipe/meson.build
+@@ -19,6 +19,15 @@
+ # SOFTWARE.
+ 
+ files_softpipe = files(
++  '../rdmetal/rdmetal_screen.c',
++  '../rdmetal/rdmetal_owner.c',
++  '../rdmetal/rdmetal_direct_resource.c',
++  '../rdmetal/rdmetal_clear_context.c',
++  '../rdmetal/rdmetal_shader_state.c',
++  '../rdmetal/emitter/nir_to_spirv.c',
++  '../rdmetal/emitter/spirv_builder.c',
++  '../rdmetal/rdmetal_sample_resource.c',
++  '../rdmetal/rdmetal_cpu_buffer.c',
+   'sp_buffer.c',
+   'sp_buffer.h',
+   'sp_clear.c',
+diff --git a/src/gallium/frontends/dri/dri2.c b/src/gallium/frontends/dri/dri2.c
+index d0f87d9..2e1785f 100644
+--- a/src/gallium/frontends/dri/dri2.c
++++ b/src/gallium/frontends/dri/dri2.c
+@@ -56,6 +56,19 @@
+ #include "dri_query_renderer.h"
+ 
+ #include "drm-uapi/drm_fourcc.h"
++#ifdef RDMETAL_IMAGE_CANDIDATE
++#include "rdmetal/rdmetal_direct_resource.h"
++/* The EGL side accepts only its current DRI image. This callback further
++ * requires that image's exact texture to be the broker-backed target. */
++__attribute__((visibility("default")))
++int rdmetal_export_dri_image_v1(const void *opaque,
++                                struct rdmetal_image_export_v1 *out)
++{
++   const __DRIimage *image = opaque;
++   if (!image || !image->texture || !out) return 0;
++   return rdmetal_direct_resource_export(image->texture, out);
++}
++#endif
+ 
+ struct dri2_buffer
+ {
+@@ -2424,6 +2437,82 @@ fail:
+    return NULL;
+ }
+ 
++#ifdef RDMETAL_IMAGE_CANDIDATE
++extern const struct drisw_loader_funcs drisw_lf;
++/* No DRM fd is fabricated. The Gallium screen comes from the software winsys
++ * while its render targets can be broker-backed rdmetal resources. */
++static const __DRIconfig **
++rdmetal_image_init_screen(struct dri_screen *screen)
++{
++   struct pipe_screen *pscreen = NULL;
++   const __DRIconfig **configs;
++   (void)mtx_init(&screen->opencl_func_mutex, mtx_plain);
++   /* GBM/EGL pass the DRM render-node fd here even for a software driver
++    * (the loader only fabricates fd == -1 for the pure-swrast fallback).
++    *
++    * Use the KMS software winsys when a real DRM fd is present so softpipe
++    * render targets are DRM dumb buffers: those are the SAME host backing the
++    * shim's present path (drmasahi.c PRIME_HANDLE_TO_FD -> drm_bo_map_by_fd)
++    * reads, so a CPU-rendered frame is exported/imported as a dma-buf and
++    * reaches the compositor non-black. Fall back to the SHM winsys when no
++    * fd is available. */
++   bool probed = false;
++#ifdef HAVE_DRISW_KMS
++   if (screen->fd >= 0 && pipe_loader_sw_probe_kms(&screen->dev, screen->fd))
++      probed = true;
++#endif
++   if (!probed && !pipe_loader_sw_probe_dri(&screen->dev, &drisw_lf))
++      return NULL;
++   pscreen = pipe_loader_create_screen(screen->dev);
++   if (!pscreen)
++      goto fail;
++   dri_init_options(screen);
++   screen->throttle = pscreen->get_param(pscreen, PIPE_CAP_THROTTLE);
++   dri2_init_screen_extensions(screen, pscreen, false);
++   configs = dri_init_screen(screen, pscreen);
++   if (!configs)
++      goto fail;
++   screen->can_share_buffer = true;
++   screen->auto_fake_front = dri_with_format(screen);
++   screen->lookup_egl_image = dri2_lookup_egl_image;
++   screen->create_drawable = dri2_create_drawable;
++   screen->allocate_buffer = dri2_allocate_buffer;
++   screen->release_buffer = dri2_release_buffer;
++   return configs;
++fail:
++   pipe_loader_release(&screen->dev, 1);
++   return NULL;
++}
++
++/* GBM's dri2_initialize_drm() calls mesa->queryCompatibleRenderOnlyDeviceFd
++ * when the primary node is not render-capable (the shim's synthetic "asahi"
++ * DRM surface only advertises a primary node).  Leaving this NULL makes the
++ * EGL loader call a null function pointer.  The software winsys renders on the
++ * CPU, so the display fd is already the render fd: return it unchanged. */
++static int
++rdmetal_query_compatible_render_only_device_fd(int kms_only_fd)
++{
++   return kms_only_fd;
++}
++
++static const struct __DRImesaCoreExtensionRec rdmetalImageMesaCoreExtension = {
++   .base = { __DRI_MESA, 1 },
++   .version_string = MESA_INTERFACE_VERSION_STRING,
++   .createNewScreen = driCreateNewScreen2,
++   .createContext = driCreateContextAttribs,
++   .initScreen = rdmetal_image_init_screen,
++   .queryCompatibleRenderOnlyDeviceFd = rdmetal_query_compatible_render_only_device_fd,
++};
++
++const __DRIextension *galliumrdmetal_driver_extensions[] = {
++   &driCoreExtension.base,
++   &rdmetalImageMesaCoreExtension.base,
++   &driImageDriverExtension.base,
++   &gallium_config_options.base,
++   NULL,
++};
++#endif
++
+ /**
+  * This is the driver specific part of the createNewScreen entry point.
+  *
+diff --git a/src/gallium/frontends/dri/dri_screen.h b/src/gallium/frontends/dri/dri_screen.h
+index b35d623..01e914d 100644
+--- a/src/gallium/frontends/dri/dri_screen.h
++++ b/src/gallium/frontends/dri/dri_screen.h
+@@ -232,6 +232,9 @@ extern const struct __DriverAPIRec dri_swrast_kms_driver_api;
+ extern const __DRIextension *dri_swrast_kms_driver_extensions[];
+ extern const struct __DriverAPIRec galliumdrm_driver_api;
+ extern const __DRIextension *galliumdrm_driver_extensions[];
++#ifdef RDMETAL_IMAGE_CANDIDATE
++extern const __DRIextension *galliumrdmetal_driver_extensions[];
++#endif
+ extern const struct __DriverAPIRec galliumsw_driver_api;
+ extern const __DRIextension *galliumsw_driver_extensions[];
+ extern const struct __DriverAPIRec galliumvk_driver_api;
+diff --git a/src/gallium/frontends/dri/drisw.c b/src/gallium/frontends/dri/drisw.c
+index 4c9b66c..69def42 100644
+--- a/src/gallium/frontends/dri/drisw.c
++++ b/src/gallium/frontends/dri/drisw.c
+@@ -507,7 +507,9 @@ static const __DRIextension *drisw_robust_screen_extensions[] = {
+    NULL
+ };
+ 
+-static const struct drisw_loader_funcs drisw_lf = {
++/* The opt-in rdmetal image loader uses the same software winsys for staging,
++ * but exposes DRI images rather than the wl_shm putImage presentation path. */
++const struct drisw_loader_funcs drisw_lf = {
+    .get_image = drisw_get_image,
+    .put_image = drisw_put_image,
+    .put_image2 = drisw_put_image2
+diff --git a/src/gallium/frontends/dri/meson.build b/src/gallium/frontends/dri/meson.build
+index 0713135..735b4b0 100644
+--- a/src/gallium/frontends/dri/meson.build
++++ b/src/gallium/frontends/dri/meson.build
+@@ -45,6 +45,9 @@ if with_dri2
+ endif
+ 
+ libdri_c_args = []
++if get_option('rdmetal-image-candidate')
++  libdri_c_args += '-DRDMETAL_IMAGE_CANDIDATE'
++endif
+ if with_gallium_zink and not with_platform_android
+   if get_option('glvnd')
+     libdri_c_args += '-DKOPPER_LIB_NAMES="libEGL_@0@ and libGLX_@0@"'.format(get_option('glvnd-vendor-name'))
+diff --git a/src/gallium/targets/dri/dri.sym.in b/src/gallium/targets/dri/dri.sym.in
+index b43cf80..725dee0 100644
+--- a/src/gallium/targets/dri/dri.sym.in
++++ b/src/gallium/targets/dri/dri.sym.in
+@@ -1,6 +1,7 @@
+ {
+ 	global:
+ 		__driDriverGetExtensions*;
++		rdmetal_export_dri_image_v1;
+ 		@nouveau_drm_screen_create@
+ 		@radeon_drm_winsys_create@
+ 		@amdgpu_winsys_create@
+diff --git a/src/gallium/targets/dri/meson.build b/src/gallium/targets/dri/meson.build
+index 8392524..5c9ab3f 100644
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -24,6 +24,9 @@
+ # configure.ac)
+ 
+ gallium_dri_c_args = []
++if get_option('rdmetal-image-candidate')
++  gallium_dri_c_args += '-DRDMETAL_IMAGE_CANDIDATE'
++endif
+ gallium_dri_ld_args = []
+ gallium_dri_link_depends = []
+ gallium_dri_drivers = []
+@@ -42,6 +45,7 @@ endif
+ libgallium_dri = shared_library(
+   'gallium_dri',
+   files('target.c'),
++  c_args : gallium_dri_c_args,
+   include_directories : [
+     inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium, inc_gallium_aux, inc_util, inc_gallium_drivers,
+     inc_gallium_winsys, include_directories('../../frontends/dri'),
+@@ -106,6 +110,7 @@ foreach d : [[with_gallium_kmsro, [
+              [with_gallium_nouveau, 'nouveau_dri.so'],
+              [with_gallium_freedreno, ['msm_dri.so', 'kgsl_dri.so']],
+              [with_gallium_softpipe, 'swrast_dri.so'],
++             [with_gallium_softpipe, 'rdmetal_dri.so'],
+              [with_gallium_softpipe and with_gallium_drisw_kms, 'kms_swrast_dri.so'],
+              [with_gallium_v3d, 'v3d_dri.so'],
+              [with_gallium_vc4, 'vc4_dri.so'],
+diff --git a/src/gallium/targets/dri/target.c b/src/gallium/targets/dri/target.c
+index 415e494..385e2ac 100644
+--- a/src/gallium/targets/dri/target.c
++++ b/src/gallium/targets/dri/target.c
+@@ -19,6 +19,21 @@ PUBLIC const __DRIextension **__driDriverGetExtensions_swrast(void)
+    return galliumsw_driver_extensions;
+ }
+ 
++/* Loader-visible bootstrap for the rdmetal Gallium backend.  Keep the Mesa
++ * software DRI frontend while the pipe_screen and Wayland winsys are added. */
++const __DRIextension **__driDriverGetExtensions_rdmetal(void);
++PUBLIC const __DRIextension **__driDriverGetExtensions_rdmetal(void)
++{
++#if defined(RDMETAL_IMAGE_CANDIDATE)
++   /* This exposes Mesa's real DRI image interface for the opt-in loader
++    * experiment. Screen/image allocation must still fail unless the
++    * broker-backed rdmetal winsys is present; no fake DRM fd is supplied. */
++   return galliumrdmetal_driver_extensions;
++#else
++   return galliumsw_driver_extensions;
++#endif
++}
++
+ #if defined(HAVE_LIBDRM)
+ 
+ const __DRIextension **__driDriverGetExtensions_kms_swrast(void);

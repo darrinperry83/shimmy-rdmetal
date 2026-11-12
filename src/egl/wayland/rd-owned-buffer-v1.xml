@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="rd_owned_buffer_v1">
+  <copyright>
+    Isolated experimental protocol. No native Mach/IOSurface rights cross this
+    Wayland socket. Not enabled in the default Hyprland session.
+  </copyright>
+  <interface name="rd_owned_buffer_v1" version="1">
+    <description summary="Owned native frame capability to wl_buffer">
+      The session host broker registers an owned window token and approved
+      guest client identity before use. This manager creates wl_buffer
+      resources for completed frame sequences. The token is an opaque 16-byte
+      capability, not an IOSurface ID or native pointer. The compositor
+      releases a frame with wl_buffer.release after the GPU has stopped
+      sampling it; a client must not reuse its producer slot sooner.
+    </description>
+    <request name="create_buffer">
+      <arg name="id" type="new_id" interface="wl_buffer"/>
+      <arg name="window_token" type="array" summary="exactly 16 opaque bytes"/>
+      <arg name="sequence_hi" type="uint"/>
+      <arg name="sequence_lo" type="uint"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+      <arg name="stride" type="uint"/>
+      <arg name="format" type="uint" summary="WL_SHM_FORMAT_ARGB8888 initially"/>
+    </request>
+    <request name="destroy" type="destructor"/>
+    <enum name="error">
+      <entry name="unauthorized" value="0" summary="client identity/token refused"/>
+      <entry name="stale" value="1" summary="frame sequence unavailable or already leased"/>
+      <entry name="invalid_format" value="2" summary="dimensions, stride, or format invalid"/>
+      <entry name="resource_limit" value="3" summary="per-client buffer cap reached"/>
+    </enum>
+  </interface>
+</protocol>

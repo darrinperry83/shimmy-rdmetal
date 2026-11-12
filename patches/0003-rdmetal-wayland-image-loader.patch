@@ -1,0 +1,406 @@
+diff --git a/src/egl/drivers/dri2/egl_dri2.h b/src/egl/drivers/dri2/egl_dri2.h
+index 57d8820..ada9fd1 100644
+--- a/src/egl/drivers/dri2/egl_dri2.h
++++ b/src/egl/drivers/dri2/egl_dri2.h
+@@ -53,6 +53,9 @@ struct wl_display;
+ struct wl_drm;
+ struct wl_registry;
+ struct wl_shm;
++#ifdef RDMETAL_IMAGE_CANDIDATE
++struct rd_owned_buffer_v1;
++#endif
+ struct wl_surface;
+ struct zwp_linux_dmabuf_v1;
+ struct zwp_linux_dmabuf_feedback_v1;
+@@ -301,6 +304,9 @@ struct dri2_egl_display {
+    struct wl_drm *wl_drm;
+    uint32_t wl_drm_version, wl_drm_name;
+    struct wl_shm *wl_shm;
++#ifdef RDMETAL_IMAGE_CANDIDATE
++   struct rd_owned_buffer_v1 *rd_owned_buffer;
++#endif
+    struct wl_event_queue *wl_queue;
+    struct zwp_linux_dmabuf_v1 *wl_dmabuf;
+    struct dri2_wl_formats formats;
+diff --git a/src/egl/drivers/dri2/platform_wayland.c b/src/egl/drivers/dri2/platform_wayland.c
+index e0fe7b3..10b0e3f 100644
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -32,6 +32,7 @@
+ #include <fcntl.h>
+ #include <limits.h>
+ #include <stdint.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -53,6 +54,57 @@
+ #include "wayland-drm-client-protocol.h"
+ #include <wayland-client.h>
+ #include <wayland-egl-backend.h>
++#ifdef RDMETAL_IMAGE_CANDIDATE
++#include "rd-owned-buffer-v1-client-protocol.h"
++#include "../../wayland/rdmetal-image-export.h"
++static const struct wl_shm_listener shm_listener;
++static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener;
++static void
++rdmetal_registry_global(void *data, struct wl_registry *registry,
++                        uint32_t name, const char *interface, uint32_t version)
++{
++   struct dri2_egl_display *dri2_dpy = data;
++   if (!strcmp(interface, wl_shm_interface.name) && !dri2_dpy->wl_shm) {
++      dri2_dpy->wl_shm = wl_registry_bind(registry, name,
++                                         &wl_shm_interface, 1);
++      if (dri2_dpy->wl_shm) {
++         wl_proxy_set_queue((struct wl_proxy *)dri2_dpy->wl_shm,
++                            dri2_dpy->wl_queue);
++         wl_shm_add_listener(dri2_dpy->wl_shm, &shm_listener, dri2_dpy);
++      }
++   }
++   if (!strcmp(interface, rd_owned_buffer_v1_interface.name) &&
++       version >= 1 && !dri2_dpy->rd_owned_buffer) {
++      dri2_dpy->rd_owned_buffer =
++         wl_registry_bind(registry, name, &rd_owned_buffer_v1_interface, 1);
++      if (dri2_dpy->rd_owned_buffer)
++         wl_proxy_set_queue((struct wl_proxy *)dri2_dpy->rd_owned_buffer,
++                            dri2_dpy->wl_queue);
++   }
++   if (getenv("RDMETAL_USE_DMABUF") &&
++       !strcmp(interface, zwp_linux_dmabuf_v1_interface.name) &&
++       version >= 3 && !dri2_dpy->wl_dmabuf) {
++      dri2_dpy->wl_dmabuf = wl_registry_bind(registry, name,
++                                             &zwp_linux_dmabuf_v1_interface, 3);
++      if (dri2_dpy->wl_dmabuf) {
++         wl_proxy_set_queue((struct wl_proxy *)dri2_dpy->wl_dmabuf,
++                            dri2_dpy->wl_queue);
++         zwp_linux_dmabuf_v1_add_listener(dri2_dpy->wl_dmabuf,
++                                           &dmabuf_listener, dri2_dpy);
++      }
++   }
++}
++static void
++rdmetal_registry_removed(void *data, struct wl_registry *registry,
++                         uint32_t name)
++{
++   (void)data; (void)registry; (void)name;
++}
++static const struct wl_registry_listener rdmetal_registry_listener = {
++   .global = rdmetal_registry_global,
++   .global_remove = rdmetal_registry_removed,
++};
++#endif
+ 
+ /*
+  * The index of entries in this table is used as a bitmask in
+@@ -339,6 +391,31 @@ wl_buffer_release(void *data, struct wl_buffer *buffer)
+ 
+    assert(i < ARRAY_SIZE(dri2_surf->color_buffers));
+ 
++#ifdef RDMETAL_IMAGE_CANDIDATE
++   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND") &&
++       getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
++      fprintf(stderr,"RDMESA_WL_BUFFER_RELEASE slot=%d image=%d\n",
++              i,dri2_surf->color_buffers[i].dri_image!=NULL);
++   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND") &&
++       getenv("RDMETAL_MOCK_FRAME_POOL")) {
++      /* Private two-frame test only. The host broker still owns the old
++       * exported image; discard the client image and never render into it
++       * again. Production must retire it on signed consumer completion. */
++      struct dri2_egl_display *dri2_dpy =
++         dri2_egl_display(dri2_surf->base.Resource.Display);
++      wl_buffer_destroy(buffer);
++      dri2_surf->color_buffers[i].wl_buffer = NULL;
++      if (dri2_surf->color_buffers[i].dri_image) {
++         dri2_dpy->image->destroyImage(dri2_surf->color_buffers[i].dri_image);
++         dri2_surf->color_buffers[i].dri_image = NULL;
++      }
++      dri2_surf->color_buffers[i].wl_release = false;
++      dri2_surf->color_buffers[i].age = 0;
++      dri2_surf->color_buffers[i].locked = false;
++      return;
++   }
++#endif
++
+    if (dri2_surf->color_buffers[i].wl_release) {
+       wl_buffer_destroy(buffer);
+       dri2_surf->color_buffers[i].wl_release = false;
+@@ -728,7 +805,8 @@ dri2_wl_create_window_surface(_EGLDisplay *disp, _EGLConfig *conf,
+    assert(dri2_wl_visuals[visual_idx].dri_image_format !=
+           __DRI_IMAGE_FORMAT_NONE);
+ 
+-   if (dri2_dpy->wl_dmabuf || dri2_dpy->wl_drm) {
++   if (dri2_dpy->wl_dmabuf || dri2_dpy->wl_drm ||
++       getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND")) {
+       dri2_surf->format = dri2_wl_visuals[visual_idx].wl_drm_format;
+    } else {
+       assert(dri2_dpy->wl_shm);
+@@ -1388,11 +1466,81 @@ create_wl_buffer(struct dri2_egl_display *dri2_dpy,
+                  struct dri2_egl_surface *dri2_surf, __DRIimage *image)
+ {
+    struct wl_buffer *ret = NULL;
++#ifdef RDMETAL_IMAGE_CANDIDATE
++   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND") &&
++       !getenv("RDMETAL_USE_DMABUF")) {
++      rdmetal_export_dri_image_v1_fn export_image;
++      struct rdmetal_image_export_v1 exported = {0};
++      struct wl_array token;
++      void *bytes;
++      struct rd_owned_buffer_v1 *manager = dri2_dpy->rd_owned_buffer;
++      /* Never export the auxiliary linear-copy image. The broker lease must
++       * refer to the exact render target submitted by the app. */
++      if (!manager || !dri2_dpy->driver || !image || !dri2_surf ||
++          !dri2_surf->current || image != dri2_surf->current->dri_image) {
++         if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
++            fprintf(stderr,"RDMESA_EXPORT_FAIL identity manager=%d driver=%d image=%d surface=%d current=%d exact=%d\n",
++                    manager!=NULL,dri2_dpy->driver!=NULL,image!=NULL,
++                    dri2_surf!=NULL,dri2_surf&&dri2_surf->current!=NULL,
++                    dri2_surf&&dri2_surf->current&&
++                    image==dri2_surf->current->dri_image);
++         return NULL;
++      }
++      export_image = dlsym(dri2_dpy->driver, "rdmetal_export_dri_image_v1");
++      if (!export_image) {
++         if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
++            fprintf(stderr,"RDMESA_EXPORT_FAIL callback_missing\n");
++         return NULL;
++      }
++      if (!export_image(image, &exported)) {
++         if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
++            fprintf(stderr,"RDMESA_EXPORT_FAIL callback_rejected\n");
++         return NULL;
++      }
++      if (
++          !exported.width || !exported.height ||
++          exported.width > 16384 || exported.height > 16384 ||
++          exported.format != WL_SHM_FORMAT_ARGB8888 ||
++          exported.stride < exported.width * 4 ||
++          exported.stride > 16384 * 4) {
++         if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
++            fprintf(stderr,"RDMESA_EXPORT_FAIL metadata\n");
++         return NULL;
++      }
++      wl_array_init(&token);
++      bytes = wl_array_add(&token, sizeof(exported.window_token));
++      if (!bytes) {
++         wl_array_release(&token);
++         return NULL;
++      }
++      memcpy(bytes, exported.window_token, sizeof(exported.window_token));
++      ret = rd_owned_buffer_v1_create_buffer(manager, &token,
++                                             exported.sequence >> 32,
++                                             exported.sequence & 0xffffffff,
++                                             exported.width, exported.height,
++                                             exported.stride, exported.format);
++      if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
++         fprintf(stderr,"RDMESA_EXPORT_BUFFER %s\n",ret?"created":"null");
++      wl_array_release(&token);
++      if (ret && dri2_surf)
++         wl_proxy_set_queue((struct wl_proxy *)ret, dri2_surf->wl_queue);
++      return ret;
++   }
++#endif
+    EGLBoolean query;
+    int width, height, fourcc, num_planes;
+    uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+    int mod_hi, mod_lo;
+ 
++   /* Allocation can fail when a bounded broker has no free image lease.
++    * The regular dma-buf route must report swap failure, not dereference a
++    * null DRI image in queryImage. */
++   if (!image) {
++      if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
++         fprintf(stderr, "RDMESA_DMABUF_NO_BACK_IMAGE\n");
++      return NULL;
++   }
++
+    query = dri2_dpy->image->queryImage(image, __DRI_IMAGE_ATTRIB_WIDTH, &width);
+    query &=
+       dri2_dpy->image->queryImage(image, __DRI_IMAGE_ATTRIB_HEIGHT, &height);
+@@ -1438,6 +1586,12 @@ create_wl_buffer(struct dri2_egl_display *dri2_dpy,
+       supported_modifier = true;
+    }
+ 
++   if (getenv("RDMETAL_AUDIT_WAYLAND_PATH") &&
++       getenv("RDMETAL_USE_DMABUF"))
++      fprintf(stderr, "RDMESA_DMABUF_SELECT fourcc=0x%x modifier=0x%llx supported=%d global=%d planes=%d\n",
++              fourcc, (unsigned long long)modifier, supported_modifier,
++              dri2_dpy->wl_dmabuf != NULL, num_planes);
++
+    if (dri2_dpy->wl_dmabuf && supported_modifier) {
+       struct zwp_linux_buffer_params_v1 *params;
+       int i;
+@@ -1451,7 +1605,7 @@ create_wl_buffer(struct dri2_egl_display *dri2_dpy,
+ 
+       for (i = 0; i < num_planes; i++) {
+          __DRIimage *p_image;
+-         int stride, offset;
++         int stride = 0, offset = 0;
+          int fd = -1;
+ 
+          p_image = dri2_dpy->image->fromPlanar(image, i, NULL);
+@@ -1470,6 +1624,10 @@ create_wl_buffer(struct dri2_egl_display *dri2_dpy,
+             dri2_dpy->image->destroyImage(p_image);
+ 
+          if (!query) {
++            if (getenv("RDMETAL_AUDIT_WAYLAND_PATH") &&
++                getenv("RDMETAL_USE_DMABUF"))
++               fprintf(stderr, "RDMESA_DMABUF_PLANE_FAIL fd=%d stride=%d offset=%d\n",
++                       fd, stride, offset);
+             if (fd >= 0)
+                close(fd);
+             zwp_linux_buffer_params_v1_destroy(params);
+@@ -1570,6 +1728,15 @@ dri2_wl_swap_buffers_with_damage(_EGLDisplay *disp, _EGLSurface *draw,
+    if (update_buffers_if_needed(dri2_surf) < 0)
+       return _eglError(EGL_BAD_ALLOC, "dri2_swap_buffers");
+ 
++#ifdef RDMETAL_IMAGE_CANDIDATE
++   /* A released wl_buffer is not permission to draw into the same exported
++    * broker image again. The signed consumer ack/rearm path is not wired yet.
++    * Reject an already-presented slot before any attach/commit can repeat it. */
++   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND") &&
++       dri2_surf->back && dri2_surf->back->wl_buffer)
++      return _eglError(EGL_BAD_ACCESS,"rdmetal frame awaits broker rearm");
++#endif
++
+    if (draw->SwapInterval > 0) {
+       dri2_surf->throttle_callback =
+          wl_surface_frame(dri2_surf->wl_surface_wrapper);
+@@ -1584,7 +1751,9 @@ dri2_wl_swap_buffers_with_damage(_EGLDisplay *disp, _EGLSurface *draw,
+    if (!dri2_surf->current->wl_buffer) {
+       __DRIimage *image;
+ 
+-      if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu)
++      if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND"))
++         image = dri2_surf->current->dri_image;
++      else if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu)
+          image = dri2_surf->current->linear_copy;
+       else
+          image = dri2_surf->current->dri_image;
+@@ -2722,6 +2891,14 @@ static const __DRIextension *swrast_loader_extensions[] = {
+ static EGLBoolean
+ dri2_initialize_wayland_swrast(_EGLDisplay *disp)
+ {
++   /* A direct Metal session must never silently present the software
++    * wl_shm path as accelerated. This guard is opt-in; ordinary Mesa's
++    * existing software fallback remains unchanged. */
++   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND")) {
++      _eglError(EGL_NOT_INITIALIZED,
++                "rdmetal direct Wayland image/winsys path unavailable");
++      return EGL_FALSE;
++   }
+    struct dri2_egl_display *dri2_dpy = dri2_display_create();
+    if (!dri2_dpy)
+       return EGL_FALSE;
+@@ -2804,6 +2981,9 @@ dri2_initialize_wayland_swrast(_EGLDisplay *disp)
+     */
+    dri2_dpy->vtbl = &dri2_wl_swrast_display_vtbl;
+ 
++   if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
++      fprintf(stderr, "RDMESA_WAYLAND_PATH swrast_wl_shm_putImage\n");
++
+    return EGL_TRUE;
+ 
+ cleanup:
+@@ -2814,6 +2994,64 @@ cleanup:
+ EGLBoolean
+ dri2_initialize_wayland(_EGLDisplay *disp)
+ {
++#ifdef RDMETAL_IMAGE_CANDIDATE
++   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND")) {
++      struct dri2_egl_display *dri2_dpy = dri2_display_create();
++      if (!dri2_dpy)
++         return EGL_FALSE;
++      disp->DriverData = (void *)dri2_dpy;
++      if (dri2_wl_formats_init(&dri2_dpy->formats) < 0)
++         goto rdmetal_failed;
++      if (disp->PlatformDisplay == NULL) {
++         dri2_dpy->wl_dpy = wl_display_connect(NULL);
++         dri2_dpy->own_device = true;
++      } else {
++         dri2_dpy->wl_dpy = disp->PlatformDisplay;
++      }
++      if (!dri2_dpy->wl_dpy)
++         goto rdmetal_failed;
++      dri2_dpy->wl_queue = wl_display_create_queue(dri2_dpy->wl_dpy);
++      dri2_dpy->wl_dpy_wrapper = wl_proxy_create_wrapper(dri2_dpy->wl_dpy);
++      if (!dri2_dpy->wl_queue || !dri2_dpy->wl_dpy_wrapper)
++         goto rdmetal_failed;
++      wl_proxy_set_queue((struct wl_proxy *)dri2_dpy->wl_dpy_wrapper,
++                         dri2_dpy->wl_queue);
++      dri2_dpy->wl_registry = wl_display_get_registry(dri2_dpy->wl_dpy_wrapper);
++      if (!dri2_dpy->wl_registry)
++         goto rdmetal_failed;
++      wl_registry_add_listener(dri2_dpy->wl_registry,
++                               &rdmetal_registry_listener, dri2_dpy);
++      if (roundtrip(dri2_dpy) < 0)
++         goto rdmetal_failed;
++      if (roundtrip(dri2_dpy) < 0 || !dri2_dpy->wl_shm ||
++          (getenv("RDMETAL_USE_DMABUF") ? !dri2_dpy->wl_dmabuf :
++           !dri2_dpy->rd_owned_buffer)) {
++         _eglError(EGL_NOT_INITIALIZED,
++                   "rdmetal required buffer or wl_shm global unavailable");
++         goto rdmetal_failed;
++      }
++      /* Private no-DRM image loader: the actual pipe resource still must
++       * pass the exact-image broker export callback at first swap. */
++      dri2_dpy->driver_name = strdup("rdmetal");
++      if (!dri2_dpy->driver_name || !dri2_load_driver_dri3(disp))
++         goto rdmetal_failed;
++      dri2_dpy->loader_extensions = dri2_loader_extensions;
++      if (!dri2_create_screen(disp) || !dri2_setup_extensions(disp))
++         goto rdmetal_failed;
++      dri2_setup_screen(disp);
++      dri2_wl_setup_swap_interval(disp);
++      if (!dri2_wl_add_configs_for_visuals(disp))
++         goto rdmetal_failed;
++      disp->Extensions.EXT_swap_buffers_with_damage = EGL_TRUE;
++      dri2_dpy->vtbl = &dri2_wl_display_vtbl;
++      if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
++         fprintf(stderr, "RDMESA_DIRECT_IMAGE_LOADER_READY\n");
++      return EGL_TRUE;
++rdmetal_failed:
++      dri2_display_destroy(disp);
++      return EGL_FALSE;
++   }
++#endif
+    if (disp->Options.ForceSoftware || disp->Options.Zink)
+       return dri2_initialize_wayland_swrast(disp);
+    else
+@@ -2830,6 +3068,10 @@ dri2_teardown_wayland(struct dri2_egl_display *dri2_dpy)
+       zwp_linux_dmabuf_v1_destroy(dri2_dpy->wl_dmabuf);
+    if (dri2_dpy->wl_shm)
+       wl_shm_destroy(dri2_dpy->wl_shm);
++#ifdef RDMETAL_IMAGE_CANDIDATE
++   if (dri2_dpy->rd_owned_buffer)
++      rd_owned_buffer_v1_destroy(dri2_dpy->rd_owned_buffer);
++#endif
+    if (dri2_dpy->wl_registry)
+       wl_registry_destroy(dri2_dpy->wl_registry);
+    if (dri2_dpy->wl_dpy_wrapper)
+diff --git a/src/egl/meson.build b/src/egl/meson.build
+index 8343bb6..b09da3e 100644
+--- a/src/egl/meson.build
++++ b/src/egl/meson.build
+@@ -131,6 +131,22 @@ if with_dri2
+     files_egl += wp_files['linux-dmabuf-unstable-v1']
+     files_egl += [wayland_drm_client_protocol_h]
+     incs_for_egl += include_directories('wayland/wayland-drm')
++    if get_option('rdmetal-image-candidate')
++      c_args_for_egl += '-DRDMETAL_IMAGE_CANDIDATE'
++      rd_owned_protocol_c = custom_target(
++        'rd-owned-buffer-v1-protocol.c',
++        input : 'wayland/rd-owned-buffer-v1.xml',
++        output : 'rd-owned-buffer-v1-protocol.c',
++        command : [prog_wl_scanner, wl_scanner_arg, '@INPUT@', '@OUTPUT@'],
++      )
++      rd_owned_protocol_h = custom_target(
++        'rd-owned-buffer-v1-client-protocol.h',
++        input : 'wayland/rd-owned-buffer-v1.xml',
++        output : 'rd-owned-buffer-v1-client-protocol.h',
++        command : [prog_wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
++      )
++      files_egl += [rd_owned_protocol_c, rd_owned_protocol_h]
++    endif
+   endif
+   if with_platform_android
+     deps_for_egl += [dep_android, idep_u_gralloc]

@@ -1,0 +1,41 @@
+diff --git a/src/c11/impl/threads_posix.c b/src/c11/impl/threads_posix.c
+index 2540e3e..7c90968 100644
+--- a/src/c11/impl/threads_posix.c
++++ b/src/c11/impl/threads_posix.c
+@@ -73,7 +73,13 @@ impl_thrd_routine(void *p)
+ void
+ call_once(once_flag *flag, void (*func)(void))
+ {
++#if defined(__GLIBC__) && defined(__GLIBC_PREREQ) && __GLIBC_PREREQ(2, 41)
++    /* glibc >= 2.41 once_flag is struct { int __data; }, layout-identical to
++     * pthread_once_t (int); cast the pointer so pthread_once writes __data. */
++    pthread_once((pthread_once_t *)flag, func);
++#else
+     pthread_once(flag, func);
++#endif
+ }
+ 
+ 
+diff --git a/src/c11/threads.h b/src/c11/threads.h
+index dbcb345..59fbb30 100644
+--- a/src/c11/threads.h
++++ b/src/c11/threads.h
+@@ -118,8 +118,17 @@ typedef pthread_cond_t  cnd_t;
+ typedef pthread_t       thrd_t;
+ typedef pthread_key_t   tss_t;
+ typedef pthread_mutex_t mtx_t;
++#  if defined(__once_flag_defined)
++/* glibc >= 2.41 C TU: once_flag + ONCE_FLAG_INIT already defined by pthread.h. */
++#  elif defined(__GLIBC__) && defined(__GLIBC_PREREQ) && __GLIBC_PREREQ(2, 41)
++/* glibc >= 2.41 C++ TU: only __once_flag is defined here; add the C11 typedef.
++ * __once_flag is struct { int __data; }, layout-identical to pthread_once_t. */
++typedef __once_flag once_flag;
++#    define ONCE_FLAG_INIT __ONCE_FLAG_INIT
++#  else
+ typedef pthread_once_t  once_flag;
+-#  define ONCE_FLAG_INIT PTHREAD_ONCE_INIT
++#    define ONCE_FLAG_INIT PTHREAD_ONCE_INIT
++#  endif
+ #  ifdef PTHREAD_DESTRUCTOR_ITERATIONS
+ #    define TSS_DTOR_ITERATIONS PTHREAD_DESTRUCTOR_ITERATIONS
+ #  else

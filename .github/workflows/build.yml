@@ -1,0 +1,69 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build rdmetal-dri (aarch64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Arch Linux ARM package
+        uses: uraimo/run-on-arch-action@v3
+        with:
+          arch: aarch64
+          distro: archarm_latest
+          githubToken: ${{ github.token }}
+          install: |
+            pacman -Syu --noconfirm
+            pacman -S --noconfirm --needed \
+              base-devel meson ninja python python-mako \
+              wayland wayland-protocols libdrm expat zlib zstd git
+          run: |
+            set -euo pipefail
+            # makepkg refuses to run as root; build under an unprivileged user.
+            useradd -m builder
+            chown -R builder:builder "$GITHUB_WORKSPACE"
+            # Keep makepkg's src/ and pkg/ working dirs out of the repo checkout
+            # (the repo already ships a src/ tree for the driver).  The final
+            # .pkg.tar.zst still lands in $GITHUB_WORKSPACE because PKGDEST
+            # defaults to $startdir.
+            mkdir -p /tmp/rdmetal-build
+            chown builder:builder /tmp/rdmetal-build
+            su - builder -c "cd '$GITHUB_WORKSPACE' && BUILDDIR=/tmp/rdmetal-build makepkg -sf --noconfirm"
+            ls -la "$GITHUB_WORKSPACE"/*.pkg.tar.zst
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdmetal-dri-aarch64
+          path: '*.pkg.tar.zst'
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rdmetal-dri-aarch64
+
+      - name: Attach .pkg.tar.zst to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.pkg.tar.zst'
