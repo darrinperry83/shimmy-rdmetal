@@ -1284,8 +1284,20 @@ static void rdmetal_texture_unmap(struct pipe_context *p,
               transfer->resource?rdmetal_sample_resource_owns(transfer->resource):0,
               transfer->box.width,transfer->box.height,
               transfer->box.x,transfer->box.y,transfer->level);
-   /* On unmap the CPU copy is complete; promote a sampled texture to the host
-    * Metal broker (full-image, tightly packed). */
+   /* On unmap the CPU copy is complete. Upload into the same broker image for
+    * a direct texture; a sampled-only fixture retains its existing path. */
+   if (transfer->resource && rdmetal_direct_resource_owns(transfer->resource) &&
+       (transfer->usage & PIPE_MAP_WRITE)) {
+      const struct rdmetal_texture_transfer *t =
+         (const struct rdmetal_texture_transfer *)transfer;
+      const struct pipe_resource *res = transfer->resource;
+      const struct pipe_box *box = &transfer->box;
+      if (transfer->level || box->x || box->y || box->z || box->depth != 1 ||
+          box->width != res->width0 || box->height != res->height0 ||
+          rdmetal_direct_resource_upload(transfer->resource, t->data,
+             (size_t)res->width0 * res->height0 * 4))
+         ctx->failed = true;
+   }
    if (transfer->resource && rdmetal_sample_resource_owns(transfer->resource)) {
       const struct rdmetal_texture_transfer *t =
          (const struct rdmetal_texture_transfer *)transfer;
@@ -1327,7 +1339,7 @@ static void rdmetal_texture_subdata(struct pipe_context *p,
                                     const void *data, unsigned stride,
                                     uintptr_t layer_stride)
 {
-   (void)usage; (void)stride; (void)layer_stride;
+   (void)usage; (void)layer_stride;
    if (!resource || !box || !data || level) { self(p)->failed = true; return; }
    if(getenv("RDMETAL_TRACE_TEXTURE"))
       fprintf(stderr,"RDMETAL_TEXTURE_SUBDATA owns=%d box=%ux%u+%d,%d stride=%u\n",
@@ -1345,6 +1357,29 @@ static void rdmetal_texture_subdata(struct pipe_context *p,
       if (rdmetal_sample_resource_upload(resource, data,
              (size_t)resource->width0 * resource->height0 * 4))
          self(p)->failed = true;
+   }
+   if (rdmetal_direct_resource_owns(resource)) {
+      if (box->x || box->y || box->z || box->depth != 1 ||
+          box->width != resource->width0 || box->height != resource->height0 ||
+          stride < resource->width0 * 4) {
+         self(p)->failed = true;
+         return;
+      }
+      const size_t row_bytes = (size_t)resource->width0 * 4;
+      const size_t bytes = row_bytes * resource->height0;
+      const void *upload = data;
+      void *packed = NULL;
+      if (stride != row_bytes) {
+         packed = malloc(bytes);
+         if (!packed) { self(p)->failed = true; return; }
+         for (unsigned y = 0; y < resource->height0; y++)
+            memcpy((char *)packed + y * row_bytes,
+                   (const char *)data + (size_t)y * stride, row_bytes);
+         upload = packed;
+      }
+      if (rdmetal_direct_resource_upload(resource, upload, bytes))
+         self(p)->failed = true;
+      free(packed);
    }
 }
 

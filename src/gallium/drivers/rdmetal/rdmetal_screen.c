@@ -158,36 +158,6 @@ static const struct rdmetal_direct_ops rdmetal_broker_ops = {
    rdmetal_broker_wait, rdmetal_broker_release
 };
 
-/* Sampled-texture broker upload/release (shim ops 8/9). The guest keeps a CPU
- * copy (texture_subdata/texture_map) and promotes it into a host MTLTexture
- * keyed by an opaque handle resolved by the signed broker. */
-static int rdmetal_broker_upload_rgba8(unsigned width, unsigned height,
-                                       const void *pixels, size_t bytes,
-                                       uint64_t *handle, uint64_t *generation)
-{
-   if (!pixels || !handle || !generation ||
-       bytes != (size_t)width * (size_t)height * 4)
-      return -EINVAL;
-   long h = syscall(0x2002L, 8L, (long)width, (long)height,
-                    (long)pixels, (long)bytes, 0L);
-   if(getenv("RDMETAL_TRACE_TEXTURE"))
-      fprintf(stderr,"RDMETAL_BROKER_UPLOAD w=%u h=%u bytes=%zu h=%ld\n",
-              width,height,bytes,h);
-   if (h <= 0)
-      return (int)h;
-   *handle = (uint64_t)h;
-   *generation = 1; /* bounded single-upload fixture generation */
-   return 0;
-}
-static void rdmetal_broker_release_texture(uint64_t handle, uint64_t generation)
-{
-   if (handle)
-      syscall(0x2002L, 9L, (long)handle, (long)generation, 0L, 0L, 0L);
-}
-static const struct rdmetal_sample_ops rdmetal_sample_broker_ops = {
-   rdmetal_broker_upload_rgba8, rdmetal_broker_release_texture
-};
-
 /* Isolated ordinary-EGL callback probe. This mock never performs GPU work and
  * is opt-in only; it tests st/mesa's driver callback/lifetime contract. */
 static long rdmetal_mock_create(unsigned width, unsigned height)
@@ -262,21 +232,14 @@ rdmetal_resource_create(struct pipe_screen *screen,
    if (rdmetal_direct_mode && templ->target == PIPE_BUFFER)
       return rdmetal_cpu_buffer_create(screen, templ);
    if (rdmetal_direct_mode) {
-      /* A sampled 2D GL_RGBA texture is promoted into a host MTLTexture on
-       * first upload instead of a softpipe surface, so a textured draw can
-       * sample it through the broker. The broker render target is always
-       * BGRA8 (B8G8R8A8), so it never matches R8G8B8A8 and stays on the direct
-       * IOSurface path. st/mesa marks every RGBA8 texture renderable, so the
-       * RENDER_TARGET bind bit alone cannot distinguish them. */
-      if (templ->target == PIPE_TEXTURE_2D &&
-          templ->format == PIPE_FORMAT_R8G8B8A8_UNORM &&
-          (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
-          templ->width0 <= 4096 && templ->height0 <= 4096)
-         return rdmetal_sample_resource_create(
-            screen, templ, NULL, 0, &rdmetal_sample_broker_ops);
+      /* st/mesa gives both an ordinary uploaded RGBA8 texture and an FBO
+       * colour attachment bind=SAMPLER_VIEW|RENDER_TARGET. They must share a
+       * resource representation: a sampled-only allocation cannot become a
+       * framebuffer, and a detached sample upload cannot be rendered into.
+       * The direct IOSurface accepts both uses and op14 uploads into it. */
       if (templ->target == PIPE_TEXTURE_2D &&
           rdmetal_direct_format_supported(templ->format) &&
-          (templ->bind & PIPE_BIND_RENDER_TARGET) &&
+          (templ->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW)) &&
           !templ->last_level && templ->depth0 == 1 &&
           templ->array_size == 1 && !templ->nr_samples &&
           templ->width0 && templ->height0 &&

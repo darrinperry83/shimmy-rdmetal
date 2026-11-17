@@ -42,6 +42,9 @@ long rdmetal_direct_resource_clear(struct pipe_resource *resource,
 long rdmetal_direct_resource_clear_rgba(struct pipe_resource *resource,
                                         const float rgba[4]);
 int rdmetal_direct_resource_wait(struct pipe_resource *resource, long fence);
+/* Upload a complete level-0 image into the existing broker-owned IOSurface. */
+int rdmetal_direct_resource_upload(struct pipe_resource *resource,
+                                   const void *pixels, size_t bytes);
 int rdmetal_direct_resource_export(struct pipe_resource *resource,
                                    struct rdmetal_image_export_v1 *out);
 
