@@ -4,8 +4,8 @@
 # rdmetal-dri: the RMatrixOS rdmetal Mesa gallium driver packaged as a drop-in
 # replacement for the system GL/EGL/GBM stack on Arch Linux ARM (aarch64).
 #
-# The driver is a softpipe-wrapping Gallium driver ("rdmetal") plus an opt-in
-# Wayland image loader.  It is registered *ahead of* softpipe as the default
+# The driver uses Metal for supported surfaces and softpipe for unsupported
+# formats. The Wayland image loader is registered *ahead of* softpipe as the default
 # software winsys driver, so a stock Hyprland/KDE install picks it up with no
 # environment variables.  Builds Mesa 24.0.9 for aarch64 with:
 #   -Dgbm=enabled -Drdmetal-image-candidate=true
@@ -40,8 +40,10 @@ prepare() {
   patch -Np1 -i "$startdir/patches/0001-glibc-2.41-c11-once-flag.patch"
   # Register the rdmetal gallium driver + the -Drdmetal-image-candidate option.
   patch -Np1 -i "$startdir/patches/0002-rdmetal-gallium-driver-build-glue.patch"
-  # Opt-in rdmetal Wayland image loader (EGL side).
+  # rdmetal Wayland image loader (EGL side).
   patch -Np1 -i "$startdir/patches/0003-rdmetal-wayland-image-loader.patch"
+  # Select the broker-backed dma-buf path without guest environment flags.
+  patch -Np1 -i "$startdir/patches/0004-rdmetal-wayland-default-dmabuf.patch"
 
   # Drop in the driver source + the private Wayland protocol from this repo.
   cp -r "$startdir/src/gallium/drivers/rdmetal" src/gallium/drivers/rdmetal

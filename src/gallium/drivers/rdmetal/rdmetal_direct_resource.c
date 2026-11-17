@@ -117,7 +117,7 @@ int rdmetal_direct_resource_export(struct pipe_resource *resource,
       candidate.width!=res->base.width0||
       candidate.height!=res->base.height0||
       candidate.stride<candidate.width*4||
-      candidate.stride>2048*4||
+      candidate.stride>4096*4||
       candidate.format!=RDMETAL_WL_ARGB8888){
       if(getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
          fprintf(stderr,"RDMESA_DRI_EXPORT_FAIL metadata size=%ux%u stride=%u format=%u seq=%llu\n",

@@ -1,0 +1,9 @@
+# Flag-free Metal path: current evidence
+
+The packaged Mesa build selects `rdmetal` before `softpipe` for its software winsys. `rdmetal_create_screen()` requires a successful, read-only local-broker capability query; the mock gate does not satisfy it. The host creates the Metal broker session without a guest renderer-selection variable. The Wayland EGL initializer now selects the direct image path by default and fails if its required dmabuf global or broker-backed screen is missing.
+
+In a disposable Arch root, a rebuilt `rdmetal_dri.so` and `libEGL.so.1.0.0` were installed without modifying the live root. With no `RDMETAL_*`, `MESA_*`, `LIBGL_*`, or `GALLIUM_*` variable, guest `eglinfo -p surfaceless` reported `rdmetal Metal (direct)`. A guest EGL triangle returned `GL_NO_ERROR`; the host log recorded `RDMETAL_FIXTURE_DRAW result=0 bytes=1272`. An isolated clear also passed. Renderer text alone was not treated as proof of GPU execution. A broker-unavailable run failed EGL initialization rather than silently advertising softpipe.
+
+This is not yet end-to-end desktop acceptance. The standalone Hyprland launch reached its virtual DRM backend, then failed `drmGetMagic` while reopening the primary card for its allocator. The full GUI boot probe did not reliably complete the getty/password handoff in the disposable root. Neither test proves a sustained compositor workload, a visible desktop, no ordinary-surface softpipe use, or login-to-compositor operation. The new default Wayland initializer builds, but has not yet passed a full Wayland client session.
+
+The `RDMETAL_HYBRID_DISABLE` and audit variables remain optional test controls. Unsupported depth, stencil, float, and non-8-bit surfaces may still enter the hybrid context; this must be measured and bounded during a full compositor run.

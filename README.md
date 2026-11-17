@@ -1,9 +1,15 @@
 # RMatrixOS-rdmetal
 
-The rdmetal Mesa driver for RMatrixOS: a softpipe-wrapping Gallium driver (registered as
+The rdmetal Mesa driver for RMatrixOS: a broker-backed Metal Gallium driver (registered as
 `rdmetal`) plus the guest-visible DRM/GBM node (`drmasahi.c`) that presents
-`/dev/dri/renderD128` to the Linux guest. The compositor (Hyprland/KDE) renders through
-rdmetal; the shim (RMatrixOS-shimmy) presents the result via Metal.
+`/dev/dri/renderD128` to the Linux guest. Supported ordinary color surfaces use
+the host Metal broker; unsupported formats can use a hybrid softpipe context.
+The shim presents completed frames through its host display path.
+
+Current verification is narrower than a finished desktop: an unmodified guest EGL
+loader selects `rdmetal Metal (direct)` without renderer flags, and an isolated
+triangle draw reached the Metal broker. Full Hyprland and Plasma sessions with
+ordinary composition entirely on Metal still need end-to-end verification.
 
 This driver is installed INTO the Arch rootfs as the system GL driver, so the standard
 `pacman -S hyprland` / `pacman -S plasma` installs "just work".
@@ -12,7 +18,7 @@ This driver is installed INTO the Arch rootfs as the system GL driver, so the st
 - `src/gallium/drivers/rdmetal/` — the Gallium driver (screen, clear/CPU/direct-resource
   contexts, shader-state, spirv emitter).
 - `src/egl/wayland/` — the private `rd_owned_buffer_v1` Wayland protocol + image-export
-  header used by the opt-in image loader.
+  header used by the Wayland image loader.
 - `patches/` — the extracted Mesa 24.0.9 patches (glibc 2.41 fix, driver registration/build
   glue, Wayland image loader). See below.
 - `drmasahi.c` / `drmasahi.h` — the shim-side DRM/GBM node (Asahi-style UAPI answered in

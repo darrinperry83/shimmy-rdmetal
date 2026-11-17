@@ -1,0 +1,92 @@
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -81,8 +81,7 @@
+          wl_proxy_set_queue((struct wl_proxy *)dri2_dpy->rd_owned_buffer,
+                             dri2_dpy->wl_queue);
+    }
+-   if (getenv("RDMETAL_USE_DMABUF") &&
+-       !strcmp(interface, zwp_linux_dmabuf_v1_interface.name) &&
++   if (!strcmp(interface, zwp_linux_dmabuf_v1_interface.name) &&
+        version >= 3 && !dri2_dpy->wl_dmabuf) {
+       dri2_dpy->wl_dmabuf = wl_registry_bind(registry, name,
+                                              &zwp_linux_dmabuf_v1_interface, 3);
+@@ -1732,7 +1731,8 @@
+    /* A released wl_buffer is not permission to draw into the same exported
+     * broker image again. The signed consumer ack/rearm path is not wired yet.
+     * Reject an already-presented slot before any attach/commit can repeat it. */
+-   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND") &&
++   if (dri2_dpy->driver_name &&
++       !strcmp(dri2_dpy->driver_name, "rdmetal") &&
+        dri2_surf->back && dri2_surf->back->wl_buffer)
+       return _eglError(EGL_BAD_ACCESS,"rdmetal frame awaits broker rearm");
+ #endif
+@@ -1751,7 +1751,8 @@
+    if (!dri2_surf->current->wl_buffer) {
+       __DRIimage *image;
+
+-      if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND"))
++      if (dri2_dpy->driver_name &&
++          !strcmp(dri2_dpy->driver_name, "rdmetal"))
+          image = dri2_surf->current->dri_image;
+       else if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu)
+          image = dri2_surf->current->linear_copy;
+@@ -2891,14 +2892,6 @@
+ static EGLBoolean
+ dri2_initialize_wayland_swrast(_EGLDisplay *disp)
+ {
+-   /* A direct Metal session must never silently present the software
+-    * wl_shm path as accelerated. This guard is opt-in; ordinary Mesa's
+-    * existing software fallback remains unchanged. */
+-   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND")) {
+-      _eglError(EGL_NOT_INITIALIZED,
+-                "rdmetal direct Wayland image/winsys path unavailable");
+-      return EGL_FALSE;
+-   }
+    struct dri2_egl_display *dri2_dpy = dri2_display_create();
+    if (!dri2_dpy)
+       return EGL_FALSE;
+@@ -2995,7 +2988,7 @@
+ dri2_initialize_wayland(_EGLDisplay *disp)
+ {
+ #ifdef RDMETAL_IMAGE_CANDIDATE
+-   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND")) {
++   {
+       struct dri2_egl_display *dri2_dpy = dri2_display_create();
+       if (!dri2_dpy)
+          return EGL_FALSE;
+@@ -3024,8 +3017,7 @@
+       if (roundtrip(dri2_dpy) < 0)
+          goto rdmetal_failed;
+       if (roundtrip(dri2_dpy) < 0 || !dri2_dpy->wl_shm ||
+-          (getenv("RDMETAL_USE_DMABUF") ? !dri2_dpy->wl_dmabuf :
+-           !dri2_dpy->rd_owned_buffer)) {
++          !dri2_dpy->wl_dmabuf) {
+          _eglError(EGL_NOT_INITIALIZED,
+                    "rdmetal required buffer or wl_shm global unavailable");
+          goto rdmetal_failed;
+--- a/src/gallium/auxiliary/target-helpers/sw_helper.h
++++ b/src/gallium/auxiliary/target-helpers/sw_helper.h
+@@ -86,11 +86,9 @@
+       "llvmpipe",
+ #endif
+ #if defined(GALLIUM_SOFTPIPE)
+-      /* rdmetal wraps softpipe (delegates every path the broker-backed Metal
+-       * resource does not own), so it is a safe DEFAULT ahead of plain
+-       * softpipe: with no GALLIUM_DRIVER set the software-winsys loader now
+-       * selects rdmetal, and rdmetal_create_screen() still falls back to the
+-       * softpipe implementation underneath. */
++      /* rdmetal is the default; its own hybrid context handles unsupported
++       * formats. A missing broker must fail instead of silently selecting a
++       * whole-screen software renderer. */
+       sw_vk ? "" : "rdmetal",
+       sw_vk ? "" : "softpipe",
+ #endif
+@@ -100,6 +98,8 @@
+       struct pipe_screen *screen = sw_screen_create_named(winsys, config, drivers[i]);
+       if (screen)
+          return screen;
++      else if (!sw_vk && strcmp(drivers[i], "rdmetal") == 0)
++         return NULL;
+       /* If the env var is set, don't keep trying things */
+       else if (i == 0 && drivers[i][0] != '\0')
+          return NULL;
