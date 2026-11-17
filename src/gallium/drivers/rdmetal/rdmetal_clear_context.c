@@ -48,6 +48,8 @@ struct rdmetal_clear_context {
    struct pipe_blend_color blend_color;
    struct pipe_viewport_state viewport;
    bool have_viewport;
+   struct pipe_scissor_state scissor;
+   bool have_scissor;
    void *fragment_sampler;
    struct pipe_sampler_view *fragment_view;
    /* The app's vertex-stage constant buffer (its MVP mat4 etc.), captured so a
@@ -382,6 +384,17 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
             RDMETAL_SP_LOCK(); ctx->softpipe->draw_vbo(ctx->softpipe, info, drawid_offset, indirect,
                                  draws, num_draws); RDMETAL_SP_UNLOCK();
          }
+      return;
+   }
+   /* The host draw packet does not yet carry a scissor rectangle. The
+    * state tracker always supplies the callback, even when the rectangle
+    * spans the whole target. Reject restrictive clipping rather than drawing
+    * outside the app's requested bounds. */
+   if (ctx->have_scissor &&
+       (ctx->scissor.minx || ctx->scissor.miny ||
+        ctx->scissor.maxx < ctx->color->width ||
+        ctx->scissor.maxy < ctx->color->height)) {
+      ctx->failed = true;
       return;
    }
    /* Clear and draw may use different host command queues. Do not race a
@@ -793,6 +806,22 @@ static void rdmetal_set_viewport_states(struct pipe_context *p,
    if (first || count != 1 || !states) { ctx->failed=true; return; }
    ctx->viewport=states[0];
    ctx->have_viewport=true;
+}
+static void rdmetal_set_scissor_states(struct pipe_context *p,
+                                       unsigned first, unsigned count,
+                                       const struct pipe_scissor_state *states)
+{
+   struct rdmetal_clear_context *ctx = self(p);
+   if (ctx->softpipe) {
+      RDMETAL_SP_LOCK();
+      ctx->softpipe->set_scissor_states(ctx->softpipe, first, count, states);
+      RDMETAL_SP_UNLOCK();
+   }
+   if (first || !count || !states) { ctx->failed = true; return; }
+   /* This bounded direct renderer has one viewport. Other viewports may be
+    * initialized by Mesa, but they cannot affect a one-viewport draw. */
+   ctx->scissor = states[0];
+   ctx->have_scissor = true;
 }
 static void rdmetal_set_constant_buffer(struct pipe_context *p,
    enum pipe_shader_type shader, uint index, bool take_ownership,
@@ -1465,6 +1494,7 @@ struct pipe_context *rdmetal_clear_context_create(struct pipe_screen *screen,
    ctx->base.set_window_rectangles=rdmetal_set_window_rectangles;
    ctx->base.set_blend_color=rdmetal_set_blend_color;
    ctx->base.set_viewport_states=rdmetal_set_viewport_states;
+   ctx->base.set_scissor_states=rdmetal_set_scissor_states;
    ctx->base.set_constant_buffer=rdmetal_set_constant_buffer;
    ctx->base.create_sampler_state=rdmetal_create_sampler_state;
    ctx->base.bind_sampler_states=rdmetal_bind_sampler_states;
