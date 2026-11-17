@@ -43,7 +43,7 @@ rdmetal_direct_resource_create(struct pipe_screen *screen,
        !ops->wait || !ops->release ||
        templ->target != PIPE_TEXTURE_2D ||
        !rdmetal_direct_format_supported(templ->format) ||
-       !(templ->bind & PIPE_BIND_RENDER_TARGET) ||
+       !(templ->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW)) ||
        templ->last_level || templ->depth0 != 1 || templ->array_size != 1 ||
        templ->nr_samples || !templ->width0 || !templ->height0 ||
        templ->width0 > 4096 || templ->height0 > 4096)
@@ -117,7 +117,7 @@ int rdmetal_direct_resource_export(struct pipe_resource *resource,
       candidate.width!=res->base.width0||
       candidate.height!=res->base.height0||
       candidate.stride<candidate.width*4||
-      candidate.stride>2048*4||
+      candidate.stride>4096*4||
       candidate.format!=RDMETAL_WL_ARGB8888){
       if(getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
          fprintf(stderr,"RDMESA_DRI_EXPORT_FAIL metadata size=%ux%u stride=%u format=%u seq=%llu\n",
@@ -186,4 +186,29 @@ rdmetal_direct_resource_wait(struct pipe_resource *resource,long fence)
    if (!resource || fence<=0 || !rdmetal_direct_resource_owns(resource)) return -1;
    struct rdmetal_direct_resource *res=(struct rdmetal_direct_resource *)resource;
    return res->wait(res->broker_handle,fence);
+}
+
+int
+rdmetal_direct_resource_upload(struct pipe_resource *resource,
+                               const void *pixels, size_t bytes)
+{
+   if (!resource || !pixels || !rdmetal_direct_resource_owns(resource) ||
+       resource->width0 > 4096 || resource->height0 > 4096 ||
+       (uint64_t)resource->width0 * resource->height0 * 4 != bytes)
+      return -EINVAL;
+
+   /* The broker knows this resource's exact dimensions and lease. Its upload
+    * operation copies into the SAME IOSurface, never a detached sample image.
+    * The source layout is explicit because the IOSurface itself is BGRA8. */
+   long format;
+   switch (resource->format) {
+   case PIPE_FORMAT_B8G8R8A8_UNORM: format = 1; break;
+   case PIPE_FORMAT_R8G8B8A8_UNORM: format = 2; break;
+   case PIPE_FORMAT_B8G8R8X8_UNORM: format = 3; break;
+   default: return -EINVAL;
+   }
+   long result = syscall(0x2002L, 14L,
+                         rdmetal_direct_resource_handle(resource),
+                         (long)pixels, (long)bytes, format, 0L);
+   return result == 0 ? 0 : result == -1 ? -errno : -EIO;
 }

@@ -6,21 +6,48 @@
 #include "rdmetal_screen.h"
 #include "rdmetal_owner.h"
 #include "rdmetal_direct_resource.h"
+#include "rdmetal_sample_resource.h"
 #include "rdmetal_clear_context.h"
 #include "rdmetal_cpu_buffer.h"
 #include "frontend/winsys_handle.h"
 #include "drm-uapi/drm.h"
+#include <errno.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-/* Bootstrap hook at Gallium's normal context operation. It delegates to
- * softpipe until authenticated Metal resources/fences are connected. */
+/* Metal is the normal renderer. Unsupported surfaces may use the separate
+ * hybrid softpipe context; the host broker validates each GPU operation. */
 static atomic_uint rdmetal_clears;
 static atomic_uint rdmetal_resources;
 static bool rdmetal_direct_mode;
+/* EGL probes and destroys multiple screens while negotiating a context. A
+ * process-global fallback pointer lets an old screen's destroy tear down a
+ * newer screen's depth/stencil context, leaving complete FBO attachments with
+ * NULL pipe surfaces. Keep the fallback tied to its owning screen instead. */
+struct rdmetal_fallback {
+   struct pipe_screen *owner, *screen;
+   struct pipe_context *context;
+   struct rdmetal_fallback *next;
+};
+static pthread_mutex_t rdmetal_fallback_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct rdmetal_fallback *rdmetal_fallbacks;
+
+struct pipe_context *rdmetal_softpipe_fallback_acquire(struct pipe_screen *owner)
+{
+   if (getenv("RDMETAL_HYBRID_DISABLE")) return NULL;
+   pthread_mutex_lock(&rdmetal_fallback_lock);
+   struct rdmetal_fallback *node = rdmetal_fallbacks;
+   while (node && node->owner != owner) node = node->next;
+   if (node && !node->context)
+      node->context = softpipe_create_context(node->screen, NULL, 0);
+   struct pipe_context *context = node ? node->context : NULL;
+   pthread_mutex_unlock(&rdmetal_fallback_lock);
+   return context;
+}
 static struct pipe_resource *(*softpipe_resource_create_cb)(struct pipe_screen *,
                                                              const struct pipe_resource *);
 static void (*softpipe_resource_destroy_cb)(struct pipe_screen *,
@@ -34,41 +61,30 @@ static struct pipe_resource *(*softpipe_resource_from_handle_cb)(struct pipe_scr
 static bool (*softpipe_is_format_supported_cb)(struct pipe_screen *,
     enum pipe_format, enum pipe_texture_target, unsigned, unsigned, unsigned);
 
-/* Test-only virtual dma-buf carrier. This is not a kernel dma-buf. A signed
- * broker must attest the IOSurface layout and exact lease before enabling a
- * production FD export. */
+/* Host-issued carrier, not a kernel dma-buf. The broker validates the exact
+ * IOSurface lease and dimensions before returning stride and an FD. */
 static bool
 rdmetal_resource_get_handle(struct pipe_screen *screen, struct pipe_context *ctx,
                             struct pipe_resource *res, struct winsys_handle *out,
                             unsigned usage)
 {
-   bool mock = getenv("RDMETAL_VIRTUAL_DMABUF_TEST") &&
-               strcmp(getenv("RDMETAL_VIRTUAL_DMABUF_TEST"),"1")==0 &&
-               getenv("RDMETAL_SHIM_OP5_MOCK") &&
-               strcmp(getenv("RDMETAL_SHIM_OP5_MOCK"),"1")==0;
-   bool signed_broker = getenv("RDMETAL_SIGNED_PRODUCER") &&
-               strcmp(getenv("RDMETAL_SIGNED_PRODUCER"),"1")==0 &&
-               getenv("RDMETAL_SIGNED_DMABUF") &&
-               strcmp(getenv("RDMETAL_SIGNED_DMABUF"),"1")==0;
    if (!rdmetal_direct_resource_owns(res)) {
       if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
          fprintf(stderr, "RDMESA_GH_NOT_OWNED\n");
       return softpipe_resource_get_handle_cb &&
          softpipe_resource_get_handle_cb(screen, ctx, res, out, usage);
    }
-   if (!out || out->plane || !(mock || signed_broker) ||
-       !getenv("RDMETAL_USE_DMABUF") ||
+   if (!out || out->plane ||
        !rdmetal_direct_format_supported(res->format) ||
-       res->width0 > 2048 || res->height0 > 2048) {
+       res->width0 > 4096 || res->height0 > 4096) {
       if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
-         fprintf(stderr, "RDMESA_GH_DENY out=%p plane=%u mock=%d signed=%d dmabuf=%d fmt=%d w=%u h=%u\n",
-                 (void*)out, out?out->plane:0, mock, signed_broker,
-                 getenv("RDMETAL_USE_DMABUF")?1:0, res->format, res->width0, res->height0);
+         fprintf(stderr, "RDMESA_GH_DENY out=%p plane=%u fmt=%d w=%u h=%u\n",
+                 (void*)out, out?out->plane:0, res->format, res->width0, res->height0);
       return false;
    }
    long handle = rdmetal_direct_resource_handle(res);
    long stride = syscall(0x2002L, 13L, handle, res->width0, res->height0, 0L, 0L);
-   if(stride<(long)res->width0*4||stride>2048L*4||stride%4)
+   if(stride<(long)res->width0*4||stride>4096L*4||stride%4)
       return false;
    out->stride = (unsigned)stride;
    out->offset = 0;
@@ -101,19 +117,21 @@ rdmetal_get_param(struct pipe_screen *screen, enum pipe_cap param)
    return softpipe_get_param_cb ? softpipe_get_param_cb(screen, param) : 0;
 }
 
-/* The broker-backed render target only allocates 8-bit BGRA/XRGB/RGBA
- * surfaces.  Report only those for render targets so the DRI config list never
- * offers a 10-bit (or other) visual that rdmetal_resource_create would refuse;
- * the software winsys would otherwise advertise every softpipe format. */
+/* Report the full softpipe format capability (including 10-bit and float
+ * render-target visuals).  Restricting render-target formats here would drop
+ * the format-dependent ES3.0/3.2 extensions (ARB_texture_rg, EXT_sRGB,
+ * EXT_color_buffer_float, ...) in st_extensions.c's compute_version_es2 and
+ * cap the advertised GLES version at 2.0 -- which makes Hyprland's
+ * eglCreateContext(GLES3.2/3.0) fail with EGL_BAD_MATCH before a single frame
+ * is drawn.  The actual broker-backed IOSurface allocation still rejects
+ * non-8-bit formats inside rdmetal_direct_resource_create and falls back to a
+ * softpipe surface, so an uncommon visual degrades to CPU rendering instead of
+ * silently downgrading the whole context. */
 static bool
 rdmetal_is_format_supported(struct pipe_screen *screen, enum pipe_format format,
                             enum pipe_texture_target target, unsigned sample_count,
                             unsigned storage_sample_count, unsigned bind)
 {
-   if (rdmetal_direct_mode &&
-       (bind & PIPE_BIND_RENDER_TARGET) &&
-       !rdmetal_direct_format_supported(format))
-      return false;
    return softpipe_is_format_supported_cb ?
       softpipe_is_format_supported_cb(screen, format, target, sample_count,
                                       storage_sample_count, bind) : false;
@@ -214,14 +232,28 @@ static struct pipe_resource *
 rdmetal_resource_create(struct pipe_screen *screen,
                         const struct pipe_resource *templ)
 {
+   if (getenv("RDMETAL_TRACE_TEXTURE") && templ &&
+       templ->target != PIPE_BUFFER)
+      fprintf(stderr,"RDMETAL_RESOURCE_CREATE direct=%d target=%u fmt=%d bind=0x%x size=%ux%u\n",
+              rdmetal_direct_mode, templ->target, templ->format, templ->bind,
+              templ->width0, templ->height0);
    if (rdmetal_direct_mode && templ->target == PIPE_BUFFER)
       return rdmetal_cpu_buffer_create(screen, templ);
    if (rdmetal_direct_mode) {
-      struct pipe_resource *res = rdmetal_direct_resource_create(screen, templ,
-         getenv("RDMETAL_SHIM_OP5_MOCK") ? &rdmetal_broker_ops :
-         getenv("RDMETAL_MOCK_BROKER") ? &rdmetal_mock_ops : &rdmetal_broker_ops);
-      if (res)
-         return res;
+      /* st/mesa gives both an ordinary uploaded RGBA8 texture and an FBO
+       * colour attachment bind=SAMPLER_VIEW|RENDER_TARGET. They must share a
+       * resource representation: a sampled-only allocation cannot become a
+       * framebuffer, and a detached sample upload cannot be rendered into.
+       * The direct IOSurface accepts both uses and op14 uploads into it. */
+      if (templ->target == PIPE_TEXTURE_2D &&
+          rdmetal_direct_format_supported(templ->format) &&
+          (templ->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW)) &&
+          !templ->last_level && templ->depth0 == 1 &&
+          templ->array_size == 1 && !templ->nr_samples &&
+          templ->width0 && templ->height0 &&
+          templ->width0 <= 4096 && templ->height0 <= 4096)
+         return rdmetal_direct_resource_create(screen, templ,
+            getenv("RDMETAL_MOCK_BROKER") ? &rdmetal_mock_ops : &rdmetal_broker_ops);
       /* The broker-backed target only allocates 8-bit color surfaces.  Let
        * softpipe allocate anything else the state tracker still asks for
        * (depth/stencil) so the EGL/dri frontend's zsbuf invariant holds. */
@@ -247,6 +279,10 @@ rdmetal_resource_destroy(struct pipe_screen *screen, struct pipe_resource *res)
       rdmetal_direct_resource_destroy(res);
       return;
    }
+   if (rdmetal_direct_mode && rdmetal_sample_resource_owns(res)) {
+      rdmetal_sample_resource_destroy(res);
+      return;
+   }
    if (rdmetal_direct_mode && rdmetal_cpu_buffer_owns(res)) {
       rdmetal_cpu_buffer_destroy(res);
       return;
@@ -261,6 +297,17 @@ static void
 rdmetal_screen_destroy(struct pipe_screen *screen)
 {
    rdmetal_owner_forget_screen(screen);
+   pthread_mutex_lock(&rdmetal_fallback_lock);
+   struct rdmetal_fallback **link = &rdmetal_fallbacks;
+   while (*link && (*link)->owner != screen) link = &(*link)->next;
+   struct rdmetal_fallback *node = *link;
+   if (node) *link = node->next;
+   pthread_mutex_unlock(&rdmetal_fallback_lock);
+   if (node) {
+      if (node->context) node->context->destroy(node->context);
+      node->screen->destroy(node->screen);
+      free(node);
+   }
    softpipe_screen_destroy_cb(screen);
 }
 
@@ -280,13 +327,10 @@ rdmetal_clear(struct pipe_context *ctx, unsigned buffers,
 static struct pipe_context *
 rdmetal_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 {
-   /* A direct context is opt-in. These flags select the driver route, not
-    * authorization: the signed shim must still establish its pinned broker
-    * session before the guest runs or every GPU syscall fails closed. */
+   /* The host establishes the broker session; guest environment variables
+    * are neither an authorization mechanism nor a renderer selection. */
    if (rdmetal_direct_mode)
-      return (getenv("RDMETAL_SHIM_OP5_MOCK") || getenv("RDMETAL_MOCK_BROKER") ||
-              getenv("RDMETAL_SIGNED_PRODUCER")) ?
-         rdmetal_clear_context_create(screen, priv, flags) : NULL;
+      return rdmetal_clear_context_create(screen, priv, flags);
    struct pipe_context *ctx = softpipe_create_context(screen, priv, flags);
    if (ctx)
       ctx->clear = rdmetal_clear;
@@ -297,15 +341,42 @@ static const char *
 rdmetal_get_name(struct pipe_screen *screen)
 {
    (void)screen;
-   return "rdmetal software bootstrap";
+   /* Direct mode routes clear/draw through the host Metal broker (not
+    * softpipe), so the renderer string must say so.  Ordinary GLES clients
+    * query GL_RENDERER to decide a software/GPU path; reporting "software
+    * bootstrap" here would wrongly send the compositor back to a CPU
+    * fallback.  Non-direct mode keeps the honest softpipe-wrapping label. */
+   return rdmetal_direct_mode ? "rdmetal Metal (direct)" :
+                                "rdmetal software bootstrap";
 }
 
 struct pipe_screen *
 rdmetal_create_screen(struct sw_winsys *winsys)
 {
-   rdmetal_direct_mode = getenv("RDMETAL_DIRECT_RESOURCE") &&
-      strcmp(getenv("RDMETAL_DIRECT_RESOURCE"), "1") == 0;
+   rdmetal_direct_mode = true;
+   /* Do not claim a Metal renderer and silently run through softpipe if the
+    * host cannot establish an authenticated local broker session. */
+   long capabilities = syscall(0x2002L, 0L, 0L, 0L, 0L, 0L, 0L);
+   if (capabilities != 0x52444d01L)
+      return NULL;
+   /* The direct context's hybrid fallback renders non-direct surfaces on a
+    * plain softpipe context. Give it its own screen so its internal upload
+    * buffers are softpipe resources (not the rdmetal_cpu_buffer the direct
+    * screen produces for PIPE_BUFFER in direct mode). */
+   struct pipe_screen *fallback = softpipe_create_screen(winsys);
    struct pipe_screen *screen = softpipe_create_screen(winsys);
+   struct rdmetal_fallback *node = screen && fallback ? calloc(1, sizeof *node) : NULL;
+   if (!node) {
+      if (fallback) fallback->destroy(fallback);
+      if (screen) screen->destroy(screen);
+      return NULL;
+   }
+   node->owner = screen;
+   node->screen = fallback;
+   pthread_mutex_lock(&rdmetal_fallback_lock);
+   node->next = rdmetal_fallbacks;
+   rdmetal_fallbacks = node;
+   pthread_mutex_unlock(&rdmetal_fallback_lock);
    if (screen) {
       softpipe_resource_create_cb = screen->resource_create;
       softpipe_resource_destroy_cb = screen->resource_destroy;
