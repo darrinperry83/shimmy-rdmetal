@@ -4,6 +4,8 @@
 #include "rdmetal_direct_resource.h"
 #include "rdmetal_sample_resource.h"
 #include "rdmetal_cpu_buffer.h"
+#include "rdmetal_fallback_route.h"
+#include "rdmetal_fallback_vertex.h"
 #include "rdmetal_screen.h"
 #include "pipe/p_state.h"
 #include "util/u_inlines.h"
@@ -34,6 +36,8 @@ static pthread_mutex_t rdmetal_softpipe_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct rdmetal_clear_context {
    struct pipe_context base;
    struct pipe_surface *color;
+   enum rdmetal_framebuffer_route framebuffer_route;
+   bool warned_unsupported_draw;
    long producer_fence;
    long draw_fences[8];
    unsigned draw_fence_count;
@@ -345,14 +349,19 @@ static void rdmetal_set_vertex_buffers(struct pipe_context *p,
    const struct pipe_vertex_buffer *buffers)
 {
    struct rdmetal_clear_context *ctx=self(p);
-   /* Keep the softpipe mirror in sync with every vertex buffer binding so a
-    * non-direct draw has real geometry. Pass take_ownership=false: softpipe
-    * takes its own references while the direct half still consumes the
-    * transferred ownership below. */
-   if (ctx->softpipe)
-      {
-         RDMETAL_SP_LOCK(); ctx->softpipe->set_vertex_buffers(ctx->softpipe, count, trailing, false, buffers); RDMETAL_SP_UNLOCK();
-      }
+   /* softpipe cannot cast a rdmetal_cpu_buffer to its own resource layout.
+    * A user-buffer view points at the same stable allocation while this
+    * context retains the original resource reference below. */
+   struct pipe_vertex_buffer mirror = {0};
+   bool mirror_valid = count == 1 && !trailing &&
+      rdmetal_fallback_vertex_bridge(buffers, &mirror);
+   if (ctx->softpipe) {
+      RDMETAL_SP_LOCK();
+      ctx->softpipe->set_vertex_buffers(ctx->softpipe, mirror_valid ? 1 : 0,
+                                       mirror_valid ? 0 : count + trailing,
+                                       false, mirror_valid ? &mirror : NULL);
+      RDMETAL_SP_UNLOCK();
+   }
    if (!ctx->vertex_buffer.is_user_buffer)
       pipe_resource_reference(&ctx->vertex_buffer.buffer.resource,NULL);
    memset(&ctx->vertex_buffer,0,sizeof(ctx->vertex_buffer));
@@ -376,14 +385,20 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    const struct pipe_draw_start_count_bias *draws,unsigned num_draws)
 {
    struct rdmetal_clear_context *ctx=self(p);
-   /* Non-direct framebuffers (float/depth/stencil/unsupported formats) are
-    * rendered by the softpipe fallback, not the bounded Metal path. */
-   if (!ctx->color) {
-      if (ctx->softpipe)
-         {
-            RDMETAL_SP_LOCK(); ctx->softpipe->draw_vbo(ctx->softpipe, info, drawid_offset, indirect,
-                                 draws, num_draws); RDMETAL_SP_UNLOCK();
-         }
+   if (ctx->framebuffer_route != RDMETAL_FB_DIRECT) {
+      bool safe = ctx->framebuffer_route == RDMETAL_FB_SOFTPIPE && ctx->softpipe;
+      if (!ctx->vertex_buffer.is_user_buffer && ctx->vertex_buffer.buffer.resource &&
+          !rdmetal_cpu_buffer_owns(ctx->vertex_buffer.buffer.resource)) safe = false;
+      if (ctx->vs_const.buffer && rdmetal_cpu_buffer_owns(ctx->vs_const.buffer)) safe = false;
+      if (info && info->index_size && !info->has_user_indices && info->index.resource &&
+          rdmetal_cpu_buffer_owns(info->index.resource)) safe = false;
+      if (safe) {
+         RDMETAL_SP_LOCK(); ctx->softpipe->draw_vbo(ctx->softpipe, info, drawid_offset,
+                                                     indirect, draws, num_draws); RDMETAL_SP_UNLOCK();
+      } else if (!ctx->warned_unsupported_draw) {
+         fprintf(stderr, "rdmetal: unsupported framebuffer/buffer ownership for fallback draw; draw skipped\n");
+         ctx->warned_unsupported_draw = true;
+      }
       return;
    }
    /* The host draw packet does not yet carry a scissor rectangle. The
@@ -829,10 +844,11 @@ static void rdmetal_set_constant_buffer(struct pipe_context *p,
 {
    struct rdmetal_clear_context *ctx = self(p);
    /* Keep the softpipe mirror in sync; it takes its own references. */
-   if (ctx->softpipe)
-      {
-         RDMETAL_SP_LOCK(); ctx->softpipe->set_constant_buffer(ctx->softpipe, shader, index, false, b); RDMETAL_SP_UNLOCK();
-      }
+   if (ctx->softpipe) {
+      const struct pipe_constant_buffer *mirror = b;
+      if (b && b->buffer && rdmetal_cpu_buffer_owns(b->buffer)) mirror = NULL;
+      RDMETAL_SP_LOCK(); ctx->softpipe->set_constant_buffer(ctx->softpipe, shader, index, false, mirror); RDMETAL_SP_UNLOCK();
+   }
    /* The bounded synthetic pipeline applies a single mat4 (the app's MVP)
     * from the vertex-stage constant buffer at index 0 on the CPU. Anything
     * else is accepted and ignored rather than failing the context, so
@@ -930,7 +946,10 @@ static struct pipe_sampler_view *rdmetal_create_sampler_view(
    /* Float/depth/stencil and any other non-Metal texture is sampled by the
     * softpipe fallback. Never hand softpipe a direct IOSurface resource (it
     * would cast it to its own resource type). */
-   if (ctx->softpipe && texture && !rdmetal_direct_resource_owns(texture))
+   if (ctx->softpipe && texture &&
+       !rdmetal_direct_resource_owns(texture) &&
+       !rdmetal_sample_resource_owns(texture) &&
+       !rdmetal_cpu_buffer_owns(texture))
       do { void *r; RDMETAL_SP_LOCK(); r = ctx->softpipe->create_sampler_view(ctx->softpipe, texture, templ); RDMETAL_SP_UNLOCK(); return r; } while (0);
    return NULL;
 }
@@ -1103,7 +1122,9 @@ static struct pipe_surface *rdmetal_create_surface(
     * softpipe surface so gles_check_float_renderable and friends never see a
     * NULL renderbuffer. */
    if(!resource || !rdmetal_direct_resource_owns(resource)) {
-      if (ctx->softpipe)
+      if (ctx->softpipe && resource &&
+          !rdmetal_sample_resource_owns(resource) &&
+          !rdmetal_cpu_buffer_owns(resource))
          {
             do { void *r; RDMETAL_SP_LOCK(); r = ctx->softpipe->create_surface(ctx->softpipe, resource, templ); RDMETAL_SP_UNLOCK(); return r; } while (0);
          }
@@ -1139,38 +1160,22 @@ static void rdmetal_set_framebuffer(struct pipe_context *context,
    struct rdmetal_clear_context *ctx=self(context);
    if(!rdmetal_wait(ctx))return;
    pipe_surface_reference(&ctx->color,NULL);
-   if (fb && fb->nr_cbufs==0 && !fb->zsbuf) {
-      if (ctx->softpipe)
-         {
-            RDMETAL_SP_LOCK(); ctx->softpipe->set_framebuffer_state(ctx->softpipe, fb); RDMETAL_SP_UNLOCK();
-         }
-      return;
+   ctx->framebuffer_route = rdmetal_framebuffer_route(fb);
+   if (ctx->framebuffer_route == RDMETAL_FB_UNSUPPORTED &&
+       !ctx->warned_unsupported_draw) {
+      fprintf(stderr, "rdmetal: mixed or unsupported framebuffer cannot be rendered by Metal or softpipe\n");
+      ctx->warned_unsupported_draw = true;
    }
-   /* A framebuffer with a depth/stencil buffer, a non-direct (float) colour,
-    * multiple samples, or anything else the Metal path rejects is owned by the
-    * softpipe fallback. Do not mark the direct context failed. */
-   const bool direct = fb && fb->nr_cbufs==1 && fb->cbufs[0] && !fb->zsbuf &&
-      !fb->samples && rdmetal_direct_resource_owns(fb->cbufs[0]->texture);
-   if(!direct){
-      /* A mixed framebuffer whose colour buffer is a direct (IOSurface) or
-       * sampled (host MTLTexture) resource cannot be rendered by the softpipe
-       * fallback: softpipe casts the resource to its own type and reads a
-       * garbage data pointer, which faults inside a util format conversion
-       * (e.g. util_format_*_srgb_pack_rgba_float). Neither path can render
-       * such a buffer (Metal rejects the depth/stencil attachment, softpipe
-       * rejects the direct colour), so skip it rather than crash. The bounded
-       * Metal RGBA8 path (direct colour, no depth/stencil) is unaffected. */
-      if (fb && fb->nr_cbufs==1 && fb->cbufs[0] &&
-          (rdmetal_direct_resource_owns(fb->cbufs[0]->texture) ||
-           rdmetal_sample_resource_owns(fb->cbufs[0]->texture)))
-         return;
-      if (ctx->softpipe)
-         {
-            RDMETAL_SP_LOCK(); ctx->softpipe->set_framebuffer_state(ctx->softpipe, fb); RDMETAL_SP_UNLOCK();
-         }
-      return;
+   if (ctx->framebuffer_route == RDMETAL_FB_DIRECT)
+      pipe_surface_reference(&ctx->color, fb->cbufs[0]);
+   else if (ctx->softpipe) {
+      /* An unsupported mixed FBO must not draw into the previous softpipe FBO. */
+      struct pipe_framebuffer_state empty = {0};
+      RDMETAL_SP_LOCK();
+      ctx->softpipe->set_framebuffer_state(ctx->softpipe,
+         ctx->framebuffer_route == RDMETAL_FB_SOFTPIPE ? fb : &empty);
+      RDMETAL_SP_UNLOCK();
    }
-   pipe_surface_reference(&ctx->color,fb->cbufs[0]);
 }
 
 static void rdmetal_clear(struct pipe_context *context,unsigned buffers,
@@ -1181,8 +1186,8 @@ static void rdmetal_clear(struct pipe_context *context,unsigned buffers,
    struct rdmetal_clear_context *ctx=self(context);
    /* No direct colour surface means the current framebuffer is non-direct:
     * clear it on the CPU via softpipe. */
-   if(!ctx->color){
-      if (ctx->softpipe)
+   if(ctx->framebuffer_route != RDMETAL_FB_DIRECT){
+      if (ctx->framebuffer_route == RDMETAL_FB_SOFTPIPE && ctx->softpipe)
          {
             RDMETAL_SP_LOCK(); ctx->softpipe->clear(ctx->softpipe, buffers, scissor, color, depth, stencil); RDMETAL_SP_UNLOCK();
          }
