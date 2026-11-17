@@ -12,6 +12,7 @@
 #include "frontend/winsys_handle.h"
 #include "drm-uapi/drm.h"
 #include <errno.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,22 +24,29 @@
 static atomic_uint rdmetal_clears;
 static atomic_uint rdmetal_resources;
 static bool rdmetal_direct_mode;
-static struct pipe_screen *rdmetal_softpipe_fallback_screen;
-static struct pipe_context *rdmetal_softpipe_fallback_context;
+/* EGL probes and destroys multiple screens while negotiating a context. A
+ * process-global fallback pointer lets an old screen's destroy tear down a
+ * newer screen's depth/stencil context, leaving complete FBO attachments with
+ * NULL pipe surfaces. Keep the fallback tied to its owning screen instead. */
+struct rdmetal_fallback {
+   struct pipe_screen *owner, *screen;
+   struct pipe_context *context;
+   struct rdmetal_fallback *next;
+};
+static pthread_mutex_t rdmetal_fallback_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct rdmetal_fallback *rdmetal_fallbacks;
 
-struct pipe_screen *rdmetal_softpipe_fallback_screen_get(void)
+struct pipe_context *rdmetal_softpipe_fallback_acquire(struct pipe_screen *owner)
 {
-   return rdmetal_softpipe_fallback_screen;
-}
-
-struct pipe_context *rdmetal_softpipe_fallback_acquire(void)
-{
-   if (getenv("RDMETAL_HYBRID_DISABLE"))
-      return NULL;
-   if (!rdmetal_softpipe_fallback_context && rdmetal_softpipe_fallback_screen)
-      rdmetal_softpipe_fallback_context =
-         softpipe_create_context(rdmetal_softpipe_fallback_screen, NULL, 0);
-   return rdmetal_softpipe_fallback_context;
+   if (getenv("RDMETAL_HYBRID_DISABLE")) return NULL;
+   pthread_mutex_lock(&rdmetal_fallback_lock);
+   struct rdmetal_fallback *node = rdmetal_fallbacks;
+   while (node && node->owner != owner) node = node->next;
+   if (node && !node->context)
+      node->context = softpipe_create_context(node->screen, NULL, 0);
+   struct pipe_context *context = node ? node->context : NULL;
+   pthread_mutex_unlock(&rdmetal_fallback_lock);
+   return context;
 }
 static struct pipe_resource *(*softpipe_resource_create_cb)(struct pipe_screen *,
                                                              const struct pipe_resource *);
@@ -289,13 +297,16 @@ static void
 rdmetal_screen_destroy(struct pipe_screen *screen)
 {
    rdmetal_owner_forget_screen(screen);
-   if (rdmetal_softpipe_fallback_context) {
-      rdmetal_softpipe_fallback_context->destroy(rdmetal_softpipe_fallback_context);
-      rdmetal_softpipe_fallback_context = NULL;
-   }
-   if (rdmetal_softpipe_fallback_screen) {
-      rdmetal_softpipe_fallback_screen->destroy(rdmetal_softpipe_fallback_screen);
-      rdmetal_softpipe_fallback_screen = NULL;
+   pthread_mutex_lock(&rdmetal_fallback_lock);
+   struct rdmetal_fallback **link = &rdmetal_fallbacks;
+   while (*link && (*link)->owner != screen) link = &(*link)->next;
+   struct rdmetal_fallback *node = *link;
+   if (node) *link = node->next;
+   pthread_mutex_unlock(&rdmetal_fallback_lock);
+   if (node) {
+      if (node->context) node->context->destroy(node->context);
+      node->screen->destroy(node->screen);
+      free(node);
    }
    softpipe_screen_destroy_cb(screen);
 }
@@ -352,8 +363,20 @@ rdmetal_create_screen(struct sw_winsys *winsys)
     * plain softpipe context. Give it its own screen so its internal upload
     * buffers are softpipe resources (not the rdmetal_cpu_buffer the direct
     * screen produces for PIPE_BUFFER in direct mode). */
-   rdmetal_softpipe_fallback_screen = softpipe_create_screen(winsys);
+   struct pipe_screen *fallback = softpipe_create_screen(winsys);
    struct pipe_screen *screen = softpipe_create_screen(winsys);
+   struct rdmetal_fallback *node = screen && fallback ? calloc(1, sizeof *node) : NULL;
+   if (!node) {
+      if (fallback) fallback->destroy(fallback);
+      if (screen) screen->destroy(screen);
+      return NULL;
+   }
+   node->owner = screen;
+   node->screen = fallback;
+   pthread_mutex_lock(&rdmetal_fallback_lock);
+   node->next = rdmetal_fallbacks;
+   rdmetal_fallbacks = node;
+   pthread_mutex_unlock(&rdmetal_fallback_lock);
    if (screen) {
       softpipe_resource_create_cb = screen->resource_create;
       softpipe_resource_destroy_cb = screen->resource_destroy;

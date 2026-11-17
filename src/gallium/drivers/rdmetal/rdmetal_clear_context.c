@@ -1424,14 +1424,14 @@ struct pipe_context *rdmetal_clear_context_create(struct pipe_screen *screen,
    (void)flags;
    struct rdmetal_clear_context *ctx=calloc(1,sizeof(*ctx));
    if(!ctx)return NULL;
-   /* The hybrid fallback: a single shared softpipe context for non-direct
-    * (float/depth/stencil) surfaces. It is shared (not per direct context)
-    * because a full softpipe context is too large for the bounded guest heap to
-    * duplicate per EGL context; it runs on its own plain softpipe screen (see
-    * rdmetal_screen.c) so its internal upload buffers are softpipe resources.
+   /* The hybrid fallback: one softpipe context per rdmetal screen for
+    * non-direct (float/depth/stencil) surfaces. Contexts on that screen share
+    * it because a full softpipe context is large; separate EGL probe screens
+    * must not destroy the active screen's fallback. It runs on its own plain
+    * softpipe screen so internal upload buffers are softpipe resources.
     * NULL means the fallback is disabled (RDMETAL_HYBRID_DISABLE=1): the direct
     * context then behaves as the pre-hybrid bounded Metal context. */
-   ctx->softpipe = rdmetal_softpipe_fallback_acquire();
+   ctx->softpipe = rdmetal_softpipe_fallback_acquire(screen);
    ctx->base.screen=screen;
    ctx->base.priv=priv;
    /* The state tracker's st_draw_quad()/st_pbo()/draw-pixels paths call
