@@ -659,24 +659,26 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    float m[16];
    memset(m,0,sizeof m);
    m[0]=0.25f; m[5]=0.25f; m[15]=1.0f; /* default: (0.25x, 0.25y, 0, 1) */
-   if (!use_real) {
-      const float *mdata = NULL;
-      if (ctx->vs_const.user_buffer && ctx->vs_const.buffer_size >= 64)
-         mdata = (const float *)((const uint8_t *)ctx->vs_const.user_buffer +
-                                 ctx->vs_const.buffer_offset);
-      else if (ctx->vs_const.buffer && ctx->vs_const.buffer_size >= 64)
-         mdata = (const float *)rdmetal_cpu_buffer_data(ctx->vs_const.buffer,
-                              ctx->vs_const.buffer_offset, 64);
-      if (mdata) {
-         bool finite = true;
-         for (unsigned k = 0; k < 16; k++) if (!isfinite(mdata[k])) finite = false;
-         if (finite) {
-            memcpy(m, mdata, sizeof m);
-            if (getenv("RDMETAL_TRACE_DRAW"))
-               fprintf(stderr,"RDMETAL_VS_MVP forwarded=[%g %g %g %g]\n",
-                       m[0],m[5],m[10],m[15]);
-         }
-      }
+   /* Read the app's vertex-stage MVP (qt_Matrix mat4). The synthetic path bakes
+    * it on the CPU; the real path forwards the raw mat4 in the packet's uniform
+    * bytes so the app's own vertex shader transforms on the GPU. */
+   const float *mdata = NULL;
+   bool mvp_finite = false;
+   if (ctx->vs_const.user_buffer && ctx->vs_const.buffer_size >= 64)
+      mdata = (const float *)((const uint8_t *)ctx->vs_const.user_buffer +
+                              ctx->vs_const.buffer_offset);
+   else if (ctx->vs_const.buffer && ctx->vs_const.buffer_size >= 64)
+      mdata = (const float *)rdmetal_cpu_buffer_data(ctx->vs_const.buffer,
+                           ctx->vs_const.buffer_offset, 64);
+   if (mdata) {
+      mvp_finite = true;
+      for (unsigned k = 0; k < 16; k++) if (!isfinite(mdata[k])) mvp_finite = false;
+   }
+   if (!use_real && mvp_finite) {
+      memcpy(m, mdata, sizeof m);
+      if (getenv("RDMETAL_TRACE_DRAW"))
+         fprintf(stderr,"RDMETAL_VS_MVP forwarded=[%g %g %g %g]\n",
+                 m[0],m[5],m[10],m[15]);
    }
 
    for (unsigned i = 0; i < out_count; i++) {
@@ -774,7 +776,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
       sizeof(struct rdmetal_draw_header_v6) : sizeof(struct rdmetal_draw_header_v4);
    size_t bytes = header_bytes +
                   (vs_count+fs_count)*sizeof(uint32_t) + vertex_bytes +
-                  index_bytes + 0u /* uniform_bytes=0 */;
+                  index_bytes + (use_real && mvp_finite ? 64u : 0u);
    if(bytes>UINT32_MAX){
       free(out_vertices);RDMETAL_FAIL(ctx);return;
    }
@@ -800,7 +802,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    v3->attr1_offset=use_real ? 8u : 12u;
    v3->index_type=index_type;
    v3->index_count=index_count;
-   v3->uniform_bytes=0;
+   v3->uniform_bytes = (use_real && mvp_finite) ? 64u : 0u;
    v3->reserved=0;
    struct rdmetal_draw_header_v4 *v4=(void *)wire;
    v4->scissor_x=sx;
@@ -822,6 +824,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    memcpy(payload,out_vertices,vertex_bytes);
    payload+=vertex_bytes;
    if(indexed){ memcpy(payload,index_data,index_bytes); }
+   if(use_real && mvp_finite){ memcpy(payload + index_bytes, mdata, 64u); }
    if(getenv("RDMETAL_TRACE_DRAW"))
       fprintf(stderr,"RDMETAL_DRAW_PACKET v%s real=%d textured=%d th=%llu tg=%llu target=%llu bytes=%zu vs=%zu fs=%zu idx=%u uv=%d scissor=%u,%u %ux%u\n",
               use_real?"6":"4",use_real?1:0,
