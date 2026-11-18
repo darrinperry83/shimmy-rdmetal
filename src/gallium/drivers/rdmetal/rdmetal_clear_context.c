@@ -1289,7 +1289,16 @@ static void rdmetal_set_framebuffer(struct pipe_context *context,
    }
    if (ctx->framebuffer_route == RDMETAL_FB_UNSUPPORTED &&
        !ctx->warned_unsupported_draw) {
-      fprintf(stderr, "rdmetal: mixed or unsupported framebuffer cannot be rendered by Metal or softpipe\n");
+      const struct pipe_resource *color = fb && fb->nr_cbufs && fb->cbufs[0] ?
+         fb->cbufs[0]->texture : NULL;
+      const struct pipe_resource *depth = fb && fb->zsbuf ? fb->zsbuf->texture : NULL;
+      fprintf(stderr,
+         "rdmetal: unsupported framebuffer colors=%u color_fmt=%d color_bind=%u color_direct=%d depth_fmt=%d depth_bind=%u samples=%u\n",
+         fb ? fb->nr_cbufs : 0, color ? (int)color->format : -1,
+         color ? color->bind : 0,
+         color ? (int)rdmetal_direct_resource_owns(color) : 0,
+         depth ? (int)depth->format : -1, depth ? depth->bind : 0,
+         fb ? fb->samples : 0);
       ctx->warned_unsupported_draw = true;
    }
    if (ctx->framebuffer_route == RDMETAL_FB_DIRECT)
