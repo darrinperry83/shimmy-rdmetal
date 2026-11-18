@@ -13,6 +13,7 @@
 struct rdmetal_shader_state {
    enum pipe_shader_type stage;
    bool textured;
+   bool real; /* compiled from the app's own NIR (not the synthetic fallback) */
    size_t count;
    uint32_t words[];
 };
@@ -129,6 +130,103 @@ rdmetal_emit_synthetic(enum pipe_shader_type stage, bool textured)
    return blob;
 }
 
+/* The bounded host draw adapter accepts exactly two shader shapes: the
+ * synthetic fallback (float3 position + float2 texcoord, one forwarded UV
+ * varying) and the application's real Qt Quick shape -- a vertex stage reading
+ * position (float2) + color (vec4 from R8G8B8A8_UNORM) + opacity (float) and
+ * writing the color and opacity varyings, plus a fragment stage consuming
+ * those varyings and one sampled image. Any other shader (uniforms, extra
+ * attributes, extra varyings) must keep using the synthetic path, otherwise
+ * the adapter rejects the packet and the whole context is marked failed. */
+static bool rdmetal_nir_supported_resources(const nir_shader *nir, bool fragment)
+{
+   if (nir->info.num_ubos || nir->info.num_ssbos || nir->info.num_images)
+      return false;
+   /* The Qt fragment may be a solid color (no texture) or sample one glyph/
+    * atlas image; the vertex stage never samples. */
+   if (fragment ? nir->info.num_textures > 1 : nir->info.num_textures != 0)
+      return false;
+   nir_foreach_variable_with_modes(var, nir,
+                                   nir_var_uniform | nir_var_mem_push_const) {
+      if (var->data.mode == nir_var_mem_push_const)
+         return false;
+      if (!glsl_type_is_sampler(glsl_without_array(var->type)))
+         return false; /* plain uniform the adapter does not bind */
+   }
+   return true;
+}
+
+static bool rdmetal_nir_float_vec(const struct glsl_type *type, unsigned comps)
+{
+   const struct glsl_type *t = glsl_without_array(type);
+   return t && glsl_get_base_type(t) == GLSL_TYPE_FLOAT &&
+          !glsl_type_is_matrix(t) && glsl_get_vector_elements(t) == comps;
+}
+
+static bool rdmetal_nir_is_qt_vertex(const nir_shader *nir)
+{
+   if (!rdmetal_nir_supported_resources(nir, false))
+      return false;
+   /* position(vec2)@0 + color(vec4)@1 + opacity(float)@2 */
+   bool loc[3] = {false, false, false};
+   unsigned n = 0;
+   nir_foreach_shader_in_variable(var, nir) {
+      if (var->data.driver_location > 2)
+         return false;
+      unsigned l = var->data.driver_location;
+      unsigned want = l == 0 ? 2 : l == 1 ? 4 : 1;
+      if (!rdmetal_nir_float_vec(var->type, want) || loc[l])
+         return false;
+      loc[l] = true;
+      n++;
+   }
+   if (n != 3 || !loc[0] || !loc[1] || !loc[2])
+      return false;
+   /* color(vec4) + opacity(float) varyings (gl_Position is a builtin) */
+   bool color = false, opacity = false;
+   n = 0;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location == VARYING_SLOT_POS)
+         continue;
+      if (rdmetal_nir_float_vec(var->type, 4))
+         color = true;
+      else if (rdmetal_nir_float_vec(var->type, 1))
+         opacity = true;
+      else
+         return false;
+      n++;
+   }
+   return n == 2 && color && opacity;
+}
+
+static bool rdmetal_nir_is_qt_fragment(const nir_shader *nir)
+{
+   if (!rdmetal_nir_supported_resources(nir, true))
+      return false;
+   /* color(vec4) + opacity(float) varyings */
+   bool color = false, opacity = false;
+   unsigned n = 0;
+   nir_foreach_shader_in_variable(var, nir) {
+      if (rdmetal_nir_float_vec(var->type, 4))
+         color = true;
+      else if (rdmetal_nir_float_vec(var->type, 1))
+         opacity = true;
+      else
+         return false;
+      n++;
+   }
+   if (n != 2 || !color || !opacity)
+      return false;
+   /* one color output */
+   n = 0;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location != FRAG_RESULT_DATA0)
+         return false;
+      n++;
+   }
+   return n == 1;
+}
+
 void *rdmetal_shader_create(enum pipe_shader_type stage,
                              const struct pipe_shader_state *state)
 {
@@ -145,13 +243,24 @@ void *rdmetal_shader_create(enum pipe_shader_type stage,
       ralloc_free(nir);
       return NULL;
    }
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    const bool textured = stage == PIPE_SHADER_FRAGMENT &&
                          nir->info.num_textures > 0;
-   /* Gallium owns the app NIR; discard it and use the bounded synthetic
-    * pipeline instead. */
+   /* Compile the application's real NIR to SPIR-V so the host Metal pipeline
+    * runs the app's own color/opacity semantics instead of the fixed synthetic
+    * substitute. The bounded adapter only accepts the Qt three-attribute shape
+    * (see the helpers above), so any other shader keeps the synthetic path;
+    * forwarding SPIR-V the adapter would reject fails the whole context. */
+   const bool qt_shape = stage == PIPE_SHADER_VERTEX ?
+      rdmetal_nir_is_qt_vertex(nir) : rdmetal_nir_is_qt_fragment(nir);
+   struct zink_shader_info info = {0};
+   info.bindless_set_idx = 2;
+   struct spirv_shader *blob = qt_shape ?
+      nir_to_spirv(nir, &info, SPIRV_VERSION(1, 0)) : NULL;
+   const bool real = blob != NULL;
+   if (!blob)
+      blob = rdmetal_emit_synthetic(stage, textured);
    ralloc_free(nir);
-
-   struct spirv_shader *blob = rdmetal_emit_synthetic(stage, textured);
    if (!blob)
       return NULL;
    struct rdmetal_shader_state *shader = NULL;
@@ -161,6 +270,7 @@ void *rdmetal_shader_create(enum pipe_shader_type stage,
       if (shader) {
          shader->stage = stage;
          shader->textured = textured;
+         shader->real = real;
          shader->count = blob->num_words;
          memcpy(shader->words, blob->words, blob->num_words * sizeof(uint32_t));
       }
@@ -187,4 +297,11 @@ bool rdmetal_shader_textured(const void *value,
 {
    const struct rdmetal_shader_state *shader = value;
    return shader && shader->stage == expected_stage && shader->textured;
+}
+
+bool rdmetal_shader_is_real(const void *value,
+                            enum pipe_shader_type expected_stage)
+{
+   const struct rdmetal_shader_state *shader = value;
+   return shader && shader->stage == expected_stage && shader->real;
 }

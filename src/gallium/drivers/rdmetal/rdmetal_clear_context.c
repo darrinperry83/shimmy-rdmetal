@@ -60,7 +60,7 @@ struct rdmetal_clear_context {
    unsigned draw_fence_count;
    bool failed;
    void *vertex_shader, *fragment_shader;
-   struct pipe_vertex_buffer vertex_buffers[2];
+   struct pipe_vertex_buffer vertex_buffers[3];
    rdmetal_draw_submit_fn draw_submit;
    void *draw_opaque;
    rdmetal_draw_poll_fn draw_poll;
@@ -103,7 +103,7 @@ static long rdmetal_draw_guest_submit(void *opaque,const void *packet,size_t byt
    (void)opaque;
    const struct rdmetal_draw_header *header=packet;
    if(!packet||bytes<sizeof(*header)||
-      bytes>sizeof(struct rdmetal_draw_header_v4)+2u*RDMETAL_DRAW_MAX_SHADER_WORDS*4u+
+      bytes>sizeof(struct rdmetal_draw_header_v6)+2u*RDMETAL_DRAW_MAX_SHADER_WORDS*4u+
             RDMETAL_DRAW_MAX_VERTEX_BYTES+RDMETAL_DRAW_MAX_INDEX_BYTES+
             RDMETAL_DRAW_MAX_UNIFORM_BYTES||
       header->total_bytes!=bytes||!header->target_handle)return -EINVAL;
@@ -131,10 +131,13 @@ static long rdmetal_draw_mock_submit(void *opaque,const void *packet,size_t byte
    if (h->version == RDMETAL_DRAW_VERSION_TEXTURE)
       prefix = sizeof(struct rdmetal_draw_header_v2);
    else if (h->version == RDMETAL_DRAW_VERSION_V3 ||
-            h->version == RDMETAL_DRAW_VERSION_V4) {
+            h->version == RDMETAL_DRAW_VERSION_V4 ||
+            h->version == RDMETAL_DRAW_VERSION_V6) {
       const struct rdmetal_draw_header_v3 *v3 = packet;
-      prefix = h->version == RDMETAL_DRAW_VERSION_V4 ?
-         sizeof(struct rdmetal_draw_header_v4) : sizeof(*v3);
+      prefix = h->version == RDMETAL_DRAW_VERSION_V6 ?
+         sizeof(struct rdmetal_draw_header_v6) :
+         h->version == RDMETAL_DRAW_VERSION_V4 ?
+            sizeof(struct rdmetal_draw_header_v4) : sizeof(*v3);
       extra = (size_t)v3->index_count *
          (v3->index_type==RDMETAL_DRAW_INDEX_U16 ? 2u :
           v3->index_type==RDMETAL_DRAW_INDEX_U32 ? 4u : 0u) +
@@ -294,12 +297,22 @@ static void rdmetal_bind_vertex_elements(struct pipe_context *p, void *s)
       }
 }
 
-struct rdmetal_vertex_elements { struct pipe_vertex_element element[2]; unsigned count; };
+struct rdmetal_vertex_elements { struct pipe_vertex_element element[3]; unsigned count; };
 static bool rdmetal_plain_position(const struct pipe_vertex_element *e)
 {
    return e && !e->vertex_buffer_index && !e->dual_slot && !e->instance_divisor &&
           (e->src_format == PIPE_FORMAT_R32G32_FLOAT ||
            e->src_format == PIPE_FORMAT_R32G32B32_FLOAT);
+}
+/* Base pointer to a CPU-backed vertex attribute buffer, already advanced past
+ * the buffer offset. The per-vertex stride/offset are applied by the caller. */
+static const uint8_t *rdmetal_vertex_buffer_data(const struct rdmetal_clear_context *ctx,
+                                                 unsigned slot, size_t bytes)
+{
+   const struct pipe_vertex_buffer *b = &ctx->vertex_buffers[slot];
+   return b->is_user_buffer ?
+      (const uint8_t *)b->buffer.user :
+      rdmetal_cpu_buffer_data(b->buffer.resource, b->buffer_offset, bytes);
 }
 static void *rdmetal_create_vertex_elements(struct pipe_context *p,
    unsigned count,const struct pipe_vertex_element *elements)
@@ -310,30 +323,43 @@ static void *rdmetal_create_vertex_elements(struct pipe_context *p,
               count, elements[0].src_format, elements[0].src_stride, elements[0].src_offset, elements[0].vertex_buffer_index,
               count>1?elements[1].src_format:0, count>1?elements[1].src_stride:0, count>1?elements[1].src_offset:0,
               count>1?elements[1].vertex_buffer_index:0, count>1?elements[1].instance_divisor:0);
-   /* The bounded Metal path accepts only a plain interleaved position(+uv)
-    * layout. The softpipe half accepts any layout, so a rejected layout still
-    * returns a valid (softpipe-only) state object. */
-   bool metal_ok = elements && count>=1 && count<=2 &&
+   /* The bounded Metal path accepts a plain interleaved position(+uv) layout
+    * or Qt's real three-attribute position+color+opacity layout. The softpipe
+    * half accepts any layout, so a rejected layout still returns a valid
+    * (softpipe-only) state object. */
+   bool metal_ok = elements && count>=1 && count<=3 &&
       rdmetal_plain_position(&elements[0]);
    if (metal_ok && count==2) {
    /* A second attribute can come from an independent CPU-backed vertex
     * buffer. Both inputs are repacked into the canonical Metal interleave. */
-      metal_ok = elements[1].vertex_buffer_index <= 1 && !elements[1].dual_slot &&
+      metal_ok = elements[1].vertex_buffer_index <= 2 && !elements[1].dual_slot &&
          !elements[1].instance_divisor &&
          (elements[1].src_format==PIPE_FORMAT_R32G32_FLOAT ||
           elements[1].src_format==PIPE_FORMAT_R32G32B32_FLOAT);
    }
+   if (metal_ok && count==3) {
+   /* Qt's real three-attribute layout: position + color (R8G8B8A8_UNORM)
+    * + opacity (R32_FLOAT), each from a bounded vertex-buffer slot. */
+      metal_ok = !elements[1].dual_slot && !elements[1].instance_divisor &&
+         !elements[2].dual_slot && !elements[2].instance_divisor &&
+         elements[1].vertex_buffer_index <= 2 &&
+         elements[2].vertex_buffer_index <= 2 &&
+         elements[1].src_format==PIPE_FORMAT_R8G8B8A8_UNORM &&
+         elements[2].src_format==PIPE_FORMAT_R32_FLOAT;
+   }
    struct rdmetal_vertex_elements *state = NULL;
    if (metal_ok) {
       if(getenv("RDMETAL_TRACE_DRAW"))
-         fprintf(stderr,"RDMETAL_CREATE_VELEM count=%u fmt=%d stride=%u off=%u fmt1=%d off1=%u\n",
+         fprintf(stderr,"RDMETAL_CREATE_VELEM count=%u fmt=%d stride=%u off=%u fmt1=%d off1=%u fmt2=%d off2=%u\n",
                  count,elements[0].src_format,elements[0].src_stride,elements[0].src_offset,
-                 count>1?elements[1].src_format:0,count>1?elements[1].src_offset:0);
+                 count>1?elements[1].src_format:0,count>1?elements[1].src_offset:0,
+                 count>2?elements[2].src_format:0,count>2?elements[2].src_offset:0);
       state=malloc(sizeof(*state));
       if(state){
          state->count=count;
          state->element[0]=elements[0];
-         if(count==2)state->element[1]=elements[1];
+         if(count>=2)state->element[1]=elements[1];
+         if(count>=3)state->element[2]=elements[2];
       }
    }
    struct rdmetal_hybrid_state *w=calloc(1,sizeof(*w));
@@ -379,12 +405,12 @@ static void rdmetal_set_vertex_buffers(struct pipe_context *p,
                                        false, mirror_valid ? &mirror : NULL);
       RDMETAL_SP_UNLOCK();
    }
-   for (unsigned i = 0; i < 2; ++i) {
+   for (unsigned i = 0; i < 3; ++i) {
       if (!ctx->vertex_buffers[i].is_user_buffer)
          pipe_resource_reference(&ctx->vertex_buffers[i].buffer.resource,NULL);
    }
    memset(ctx->vertex_buffers,0,sizeof(ctx->vertex_buffers));
-   if (count > 2 || (count && !buffers)) { RDMETAL_FAIL(ctx); return; }
+   if (count > 3 || (count && !buffers)) { RDMETAL_FAIL(ctx); return; }
    for (unsigned i = 0; i < count; ++i) {
       const struct pipe_vertex_buffer *src=&buffers[i];
       if (src->is_user_buffer ? !src->buffer.user :
@@ -411,7 +437,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    struct rdmetal_clear_context *ctx=self(p);
    if (ctx->framebuffer_route != RDMETAL_FB_DIRECT) {
       bool safe = ctx->framebuffer_route == RDMETAL_FB_SOFTPIPE && ctx->softpipe;
-      for (unsigned i=0;i<2;i++)
+      for (unsigned i=0;i<3;i++)
          if (!ctx->vertex_buffers[i].is_user_buffer &&
              ctx->vertex_buffers[i].buffer.resource &&
              !rdmetal_cpu_buffer_owns(ctx->vertex_buffers[i].buffer.resource)) safe = false;
@@ -533,12 +559,20 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
       }
    }
 
-   /* Position is float2 or float3. A second attribute is the real float2
-    * texcoord (forwarded); a float3 second attribute (es2gears normal) is
-    * ignored. The canonical interleave is always float3 position + float2
-    * texcoord (20 bytes); a single-attribute draw synthesizes a
-    * position-derived texcoord. */
-   const bool has_uv = ve->count==2 &&
+   /* Position is float2 or float3. The canonical synthetic path packs a
+    * float3 position + float2 texcoord interleave (20 bytes) and bakes the
+    * MVP/viewport on the CPU. Qt's real three-attribute layout
+    * (position + color + opacity) is forwarded verbatim so the app's own
+    * vertex shader transforms position and carries color/opacity varyings to
+    * the fragment stage. */
+   const bool real_triple = ve->count==3 &&
+      ve->element[0].src_format==PIPE_FORMAT_R32G32_FLOAT &&
+      ve->element[1].src_format==PIPE_FORMAT_R8G8B8A8_UNORM &&
+      ve->element[2].src_format==PIPE_FORMAT_R32_FLOAT;
+   const bool use_real = real_triple &&
+      rdmetal_shader_is_real(metal_vs,PIPE_SHADER_VERTEX) &&
+      rdmetal_shader_is_real(metal_fs,PIPE_SHADER_FRAGMENT);
+   const bool has_uv = !use_real && ve->count==2 &&
       ve->element[1].src_format==PIPE_FORMAT_R32G32_FLOAT;
    const unsigned pos_floats =
       ve->element[0].src_format==PIPE_FORMAT_R32G32B32_FLOAT ? 3u : 2u;
@@ -547,8 +581,16 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    const unsigned uv_slot = has_uv ? ve->element[1].vertex_buffer_index : 0;
    const unsigned pos_offset = ve->element[0].src_offset;
    const unsigned uv_offset = has_uv ? ve->element[1].src_offset : 0;
+   const unsigned color_stride = use_real ? ve->element[1].src_stride : 0;
+   const unsigned color_slot = use_real ? ve->element[1].vertex_buffer_index : 0;
+   const unsigned color_offset = use_real ? ve->element[1].src_offset : 0;
+   const unsigned opacity_stride = use_real ? ve->element[2].src_stride : 0;
+   const unsigned opacity_slot = use_real ? ve->element[2].vertex_buffer_index : 0;
+   const unsigned opacity_offset = use_real ? ve->element[2].src_offset : 0;
    if (pos_offset + pos_floats*4 > src_stride) { RDMETAL_FAIL(ctx); return; }
    if (has_uv && uv_offset + 8 > uv_stride) { RDMETAL_FAIL(ctx); return; }
+   if (use_real && (color_offset + 4 > color_stride ||
+                    opacity_offset + 4 > opacity_stride)) { RDMETAL_FAIL(ctx); return; }
 
    const unsigned source_count = indexed ? (max_index + 1u) : draws[0].count;
    if (!source_count || source_count > 65535) { RDMETAL_FAIL(ctx); return; }
@@ -583,27 +625,41 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
          if (getenv("RDMETAL_TRACE_DRAW")) fprintf(stderr,"RDMETAL_FAIL_UV slot=%u resource=%p user=%p offset=%u bytes=%zu\n",uv_slot,(void*)uv_buffer->buffer.resource,uv_buffer->buffer.user,uv_buffer->buffer_offset,uv_bytes);
          RDMETAL_FAIL(ctx); return; }
    }
+   const uint8_t *src_color_vertices = NULL;
+   const uint8_t *src_opacity_vertices = NULL;
+   if (use_real) {
+      size_t color_bytes=(size_t)source_max * color_stride + color_offset + 4u;
+      size_t opacity_bytes=(size_t)source_max * opacity_stride + opacity_offset + 4u;
+      src_color_vertices=rdmetal_vertex_buffer_data(ctx, color_slot, color_bytes);
+      src_opacity_vertices=rdmetal_vertex_buffer_data(ctx, opacity_slot, opacity_bytes);
+      if (!src_color_vertices || !src_opacity_vertices) {
+         if (getenv("RDMETAL_TRACE_DRAW")) fprintf(stderr,"RDMETAL_FAIL_COLOR_OPACITY color_slot=%u opacity_slot=%u\n",color_slot,opacity_slot);
+         RDMETAL_FAIL(ctx); return; }
+   }
    if(getenv("RDMETAL_TRACE_DRAW")){
       const float *f=(const float *)src_vertices;
       for(unsigned k=0;k<18&&k*sizeof(float)<source_bytes;k++)
          fprintf(stderr,"RDMETAL_VERT[%u]=%f\n",k,f[k]);
    }
 
-   /* Canonical float3 pos + float2 uv interleave (20 bytes). */
-   const unsigned out_stride = 12u + 8u;
+   /* Real path: raw float2 position + u8x4 color + float opacity (16 bytes).
+    * Synthetic path: canonical float3 pos + float2 uv interleave (20 bytes). */
+   const unsigned out_stride = use_real ? 16u : (12u + 8u);
    const unsigned out_count = indexed ? source_count : triangle_count;
    size_t vertex_bytes = (size_t)out_count * out_stride;
    if (vertex_bytes > RDMETAL_DRAW_MAX_VERTEX_BYTES) { RDMETAL_FAIL(ctx); return; }
    uint8_t *out_vertices = malloc(vertex_bytes ? vertex_bytes : 1);
    if (!out_vertices) { RDMETAL_FAIL(ctx); return; }
 
-   /* Forward the app's single mat4 MVP (first 64 bytes of the vertex-stage
-    * constant buffer) on the CPU; default to the bounded 0.25-scale identity
-    * when no uniform is bound. Column-major (GLSL std140 / Metal layout). */
+   /* The synthetic path bakes the app's single mat4 MVP (first 64 bytes of the
+    * vertex-stage constant buffer) on the CPU; default to the bounded
+    * 0.25-scale identity when no uniform is bound. Column-major (GLSL std140 /
+    * Metal layout). The real path lets the app's own vertex shader transform
+    * position, so no CPU transform is applied. */
    float m[16];
    memset(m,0,sizeof m);
    m[0]=0.25f; m[5]=0.25f; m[15]=1.0f; /* default: (0.25x, 0.25y, 0, 1) */
-   {
+   if (!use_real) {
       const float *mdata = NULL;
       if (ctx->vs_const.user_buffer && ctx->vs_const.buffer_size >= 64)
          mdata = (const float *)((const uint8_t *)ctx->vs_const.user_buffer +
@@ -640,8 +696,19 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
       } else {
          src_idx = (int64_t)draws[0].start + i;
       }
-      float *dp = (float *)(out_vertices + (size_t)i * out_stride);
-      if (src_idx < 0) { memset(dp,0,out_stride); continue; }
+      uint8_t *dst = out_vertices + (size_t)i * out_stride;
+      if (src_idx < 0) { memset(dst,0,out_stride); continue; }
+      if (use_real) {
+         /* Forward the raw position (float2), color (u8x4) and opacity (float);
+          * the app's vertex shader does the transform and carries color/opacity
+          * varyings to the fragment stage. */
+         const float *sp = (const float *)(src_vertices + (size_t)src_idx * src_stride);
+         memcpy(dst, sp + pos_offset/4, 8u);
+         memcpy(dst + 8, src_color_vertices + (size_t)src_idx * color_stride + color_offset, 4u);
+         memcpy(dst + 12, src_opacity_vertices + (size_t)src_idx * opacity_stride + opacity_offset, 4u);
+         continue;
+      }
+      float *dp = (float *)dst;
       const float *sp = (const float *)(src_vertices + (size_t)src_idx * src_stride);
       const float px = sp[pos_offset/4 + 0];
       const float py = sp[pos_offset/4 + 1];
@@ -703,7 +770,8 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
       }
    }
    size_t index_bytes = indexed ? (size_t)index_count * index_size : 0;
-   const size_t header_bytes = sizeof(struct rdmetal_draw_header_v4);
+   const size_t header_bytes = use_real ?
+      sizeof(struct rdmetal_draw_header_v6) : sizeof(struct rdmetal_draw_header_v4);
    size_t bytes = header_bytes +
                   (vs_count+fs_count)*sizeof(uint32_t) + vertex_bytes +
                   index_bytes + 0u /* uniform_bytes=0 */;
@@ -715,21 +783,21 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    struct rdmetal_draw_header *wire=calloc(1,bytes);
    if(!wire){free(out_vertices);RDMETAL_FAIL(ctx);return;}
    wire->magic=RDMETAL_DRAW_MAGIC;
-   wire->version=RDMETAL_DRAW_VERSION_V4;
+   wire->version=use_real ? RDMETAL_DRAW_VERSION_V6 : RDMETAL_DRAW_VERSION_V4;
    wire->total_bytes=(uint32_t)bytes;wire->target_handle=handle;
    wire->target_width=ctx->color->width;wire->target_height=ctx->color->height;
    wire->vertex_count=triangle_count;
    wire->vertex_stride=out_stride;
    wire->attribute_offset=0;
-   wire->attribute_format=RDMETAL_DRAW_ATTR_FLOAT3;
+   wire->attribute_format=use_real ? RDMETAL_DRAW_ATTR_FLOAT2 : RDMETAL_DRAW_ATTR_FLOAT3;
    wire->vertex_shader_words=vs_count;wire->fragment_shader_words=fs_count;
    wire->vertex_bytes=vertex_bytes;
    struct rdmetal_draw_header_v3 *v3=(void *)wire;
    v3->base.texture_handle=texture_handle;
    v3->base.texture_generation=texture_generation;
    v3->base.sampler_flags=0;v3->base.reserved=0;
-   v3->attr1_format=RDMETAL_DRAW_ATTR_FLOAT2;
-   v3->attr1_offset=12u;
+   v3->attr1_format=use_real ? RDMETAL_DRAW_ATTR_U8X4_UNORM : RDMETAL_DRAW_ATTR_FLOAT2;
+   v3->attr1_offset=use_real ? 8u : 12u;
    v3->index_type=index_type;
    v3->index_count=index_count;
    v3->uniform_bytes=0;
@@ -739,6 +807,13 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    v4->scissor_y=sy;
    v4->scissor_width=ex-sx;
    v4->scissor_height=ey-sy;
+   if (use_real) {
+      struct rdmetal_draw_header_v6 *v6=(void *)wire;
+      /* depth_handle stays zero: the current direct draw path carries no depth
+       * lease, and V6 permits a zero lease (unlike V5, which always has one). */
+      v6->attr2_format=RDMETAL_DRAW_ATTR_FLOAT;
+      v6->attr2_offset=12u;
+   }
    uint8_t *payload=(uint8_t *)wire+header_bytes;
    memcpy(payload,vs,vs_count*sizeof(uint32_t));
    payload+=vs_count*sizeof(uint32_t);
@@ -748,7 +823,8 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    payload+=vertex_bytes;
    if(indexed){ memcpy(payload,index_data,index_bytes); }
    if(getenv("RDMETAL_TRACE_DRAW"))
-      fprintf(stderr,"RDMETAL_DRAW_PACKET v4 textured=%d th=%llu tg=%llu target=%llu bytes=%zu vs=%zu fs=%zu idx=%u uv=%d scissor=%u,%u %ux%u\n",
+      fprintf(stderr,"RDMETAL_DRAW_PACKET v%s real=%d textured=%d th=%llu tg=%llu target=%llu bytes=%zu vs=%zu fs=%zu idx=%u uv=%d scissor=%u,%u %ux%u\n",
+              use_real?"6":"4",use_real?1:0,
               textured,(unsigned long long)texture_handle,(unsigned long long)texture_generation,
               (unsigned long long)handle,bytes,vs_count,fs_count,index_count,has_uv,
               sx,sy,ex-sx,ey-sy);
@@ -1212,7 +1288,7 @@ static void rdmetal_destroy_context(struct pipe_context *context)
       u_upload_destroy(ctx->base.stream_uploader);
    ctx->base.stream_uploader = NULL;
    ctx->base.const_uploader = NULL;
-   for (unsigned i=0;i<2;i++)
+   for (unsigned i=0;i<3;i++)
       if (!ctx->vertex_buffers[i].is_user_buffer)
          pipe_resource_reference(&ctx->vertex_buffers[i].buffer.resource,NULL);
    pipe_resource_reference(&ctx->vs_const.buffer,NULL);
