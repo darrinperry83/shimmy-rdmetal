@@ -301,7 +301,7 @@ static void rdmetal_bind_vertex_elements(struct pipe_context *p, void *s)
       }
 }
 
-struct rdmetal_vertex_elements { struct pipe_vertex_element element[2]; unsigned count; };
+struct rdmetal_vertex_elements { struct pipe_vertex_element element[3]; unsigned count; };
 static bool rdmetal_plain_position(const struct pipe_vertex_element *e)
 {
    return e && !e->vertex_buffer_index && !e->dual_slot && !e->instance_divisor &&
@@ -313,10 +313,13 @@ static void *rdmetal_create_vertex_elements(struct pipe_context *p,
 {
    struct rdmetal_clear_context *ctx = self(p);
    if(getenv("RDMETAL_TRACE_DRAW")&&elements&&count)
-      fprintf(stderr,"RDMETAL_CREATE_VELEM_RAW count=%u f0=%d s0=%u o0=%u b0=%u f1=%d s1=%u o1=%u b1=%u div=%u\n",
+      fprintf(stderr,"RDMETAL_CREATE_VELEM_RAW count=%u f0=%d s0=%u o0=%u b0=%u f1=%d s1=%u o1=%u b1=%u f2=%d s2=%u o2=%u b2=%u div=%u\n",
               count, elements[0].src_format, elements[0].src_stride, elements[0].src_offset, elements[0].vertex_buffer_index,
               count>1?elements[1].src_format:0, count>1?elements[1].src_stride:0, count>1?elements[1].src_offset:0,
-              count>1?elements[1].vertex_buffer_index:0, count>1?elements[1].instance_divisor:0);
+              count>1?elements[1].vertex_buffer_index:0,
+              count>2?elements[2].src_format:0, count>2?elements[2].src_stride:0,
+              count>2?elements[2].src_offset:0, count>2?elements[2].vertex_buffer_index:0,
+              count>1?elements[1].instance_divisor:0);
    /* The bounded Metal path accepts only a plain interleaved position(+uv)
     * layout. The softpipe half accepts any layout, so a rejected layout still
     * returns a valid (softpipe-only) state object. */
