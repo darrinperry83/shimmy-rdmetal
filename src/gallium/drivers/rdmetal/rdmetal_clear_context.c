@@ -64,7 +64,7 @@ struct rdmetal_clear_context {
    unsigned draw_fence_count;
    bool failed;
    void *vertex_shader, *fragment_shader;
-   struct pipe_vertex_buffer vertex_buffers[2];
+   struct pipe_vertex_buffer vertex_buffers[3];
    rdmetal_draw_submit_fn draw_submit;
    void *draw_opaque;
    rdmetal_draw_poll_fn draw_poll;
@@ -323,7 +323,7 @@ static void *rdmetal_create_vertex_elements(struct pipe_context *p,
    /* The bounded Metal path accepts only a plain interleaved position(+uv)
     * layout. The softpipe half accepts any layout, so a rejected layout still
     * returns a valid (softpipe-only) state object. */
-   bool metal_ok = elements && count>=1 && count<=2 &&
+   bool metal_ok = elements && count>=1 && count<=3 &&
       rdmetal_plain_position(&elements[0]);
    if (metal_ok && count==2) {
    /* A second attribute can come from an independent CPU-backed vertex
@@ -332,6 +332,18 @@ static void *rdmetal_create_vertex_elements(struct pipe_context *p,
          !elements[1].instance_divisor &&
          (elements[1].src_format==PIPE_FORMAT_R32G32_FLOAT ||
           elements[1].src_format==PIPE_FORMAT_R32G32B32_FLOAT);
+   }
+   if(metal_ok && count==3){
+      /* Diagnostic acceptance of Qt Quick's observed position, color/UV,
+       * opacity layout. Color and opacity still need real shader forwarding
+       * before this path can be promoted as correct rendering. */
+      metal_ok = !elements[1].dual_slot && !elements[2].dual_slot &&
+         !elements[1].instance_divisor && !elements[2].instance_divisor &&
+         elements[1].vertex_buffer_index<=2 &&
+         elements[2].vertex_buffer_index<=2 &&
+         (elements[1].src_format==PIPE_FORMAT_R8G8B8A8_UNORM ||
+          elements[1].src_format==PIPE_FORMAT_R32G32_FLOAT) &&
+         elements[2].src_format==PIPE_FORMAT_R32_FLOAT;
    }
    struct rdmetal_vertex_elements *state = NULL;
    if (metal_ok) {
@@ -343,7 +355,8 @@ static void *rdmetal_create_vertex_elements(struct pipe_context *p,
       if(state){
          state->count=count;
          state->element[0]=elements[0];
-         if(count==2)state->element[1]=elements[1];
+         if(count>=2)state->element[1]=elements[1];
+         if(count==3)state->element[2]=elements[2];
       }
    }
    struct rdmetal_hybrid_state *w=calloc(1,sizeof(*w));
@@ -389,12 +402,12 @@ static void rdmetal_set_vertex_buffers(struct pipe_context *p,
                                        false, mirror_valid ? &mirror : NULL);
       RDMETAL_SP_UNLOCK();
    }
-   for (unsigned i = 0; i < 2; ++i) {
+   for (unsigned i = 0; i < 3; ++i) {
       if (!ctx->vertex_buffers[i].is_user_buffer)
          pipe_resource_reference(&ctx->vertex_buffers[i].buffer.resource,NULL);
    }
    memset(ctx->vertex_buffers,0,sizeof(ctx->vertex_buffers));
-   if (count > 2 || (count && !buffers)) { RDMETAL_FAIL(ctx); return; }
+   if (count > 3 || (count && !buffers)) { RDMETAL_FAIL(ctx); return; }
    for (unsigned i = 0; i < count; ++i) {
       const struct pipe_vertex_buffer *src=&buffers[i];
       if (src->is_user_buffer ? !src->buffer.user :
@@ -432,7 +445,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
             dsa ? dsa->stencil[1].enabled : 0);
       }
       bool safe = ctx->framebuffer_route == RDMETAL_FB_SOFTPIPE && ctx->softpipe;
-      for (unsigned i=0;i<2;i++)
+      for (unsigned i=0;i<3;i++)
          if (!ctx->vertex_buffers[i].is_user_buffer &&
              ctx->vertex_buffers[i].buffer.resource &&
              !rdmetal_cpu_buffer_owns(ctx->vertex_buffers[i].buffer.resource)) safe = false;
@@ -559,7 +572,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
     * ignored. The canonical interleave is always float3 position + float2
     * texcoord (20 bytes); a single-attribute draw synthesizes a
     * position-derived texcoord. */
-   const bool has_uv = ve->count==2 &&
+   const bool has_uv = ve->count>=2 &&
       ve->element[1].src_format==PIPE_FORMAT_R32G32_FLOAT;
    const unsigned pos_floats =
       ve->element[0].src_format==PIPE_FORMAT_R32G32B32_FLOAT ? 3u : 2u;
@@ -1255,7 +1268,7 @@ static void rdmetal_destroy_context(struct pipe_context *context)
       u_upload_destroy(ctx->base.stream_uploader);
    ctx->base.stream_uploader = NULL;
    ctx->base.const_uploader = NULL;
-   for (unsigned i=0;i<2;i++)
+   for (unsigned i=0;i<3;i++)
       if (!ctx->vertex_buffers[i].is_user_buffer)
          pipe_resource_reference(&ctx->vertex_buffers[i].buffer.resource,NULL);
    pipe_resource_reference(&ctx->vs_const.buffer,NULL);
