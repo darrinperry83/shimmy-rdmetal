@@ -16,4 +16,8 @@ const uint32_t *rdmetal_shader_words(const void *shader,
  * (the forwarded texcoord varying + texture slot 0). */
 bool rdmetal_shader_textured(const void *shader,
                              enum pipe_shader_type expected_stage);
+/* True when this stage was compiled from the application's own NIR (real
+ * shader) rather than the fixed synthetic fallback pipeline. */
+bool rdmetal_shader_is_real(const void *shader,
+                            enum pipe_shader_type expected_stage);
 #endif
