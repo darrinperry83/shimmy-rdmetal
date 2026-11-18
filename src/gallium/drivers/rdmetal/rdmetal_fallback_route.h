@@ -15,7 +15,9 @@ static inline enum rdmetal_framebuffer_route
 rdmetal_framebuffer_route(const struct pipe_framebuffer_state *fb)
 {
    if (!fb) return RDMETAL_FB_UNSUPPORTED;
-   if (fb->nr_cbufs == 1 && fb->cbufs[0] && !fb->samples &&
+   if (fb->nr_cbufs == 1 && fb->cbufs[0] && fb->cbufs[0]->texture &&
+       !fb->samples &&
+       fb->cbufs[0]->texture->format != PIPE_FORMAT_A8_UNORM &&
        rdmetal_direct_resource_owns(fb->cbufs[0]->texture) &&
        (!fb->zsbuf || (rdmetal_depth_resource_owns(fb->zsbuf->texture) &&
                       fb->zsbuf->width==fb->cbufs[0]->width &&

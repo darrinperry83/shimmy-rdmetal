@@ -125,8 +125,7 @@ rdmetal_direct_resource_create(struct pipe_screen *screen,
        templ->target != PIPE_TEXTURE_2D ||
        !(rdmetal_direct_format_supported(templ->format) ||
          (templ->format == PIPE_FORMAT_A8_UNORM &&
-          (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
-          !(templ->bind & PIPE_BIND_RENDER_TARGET))) ||
+          (templ->bind & PIPE_BIND_SAMPLER_VIEW))) ||
        !(templ->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW)) ||
        templ->last_level || templ->depth0 != 1 || templ->array_size != 1 ||
        templ->nr_samples || !templ->width0 || !templ->height0 ||
