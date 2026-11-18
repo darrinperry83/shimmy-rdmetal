@@ -418,8 +418,8 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
          const struct pipe_depth_stencil_alpha_state *dsa = ctx->depth_stencil_alpha;
          fprintf(stderr,
             "RDMETAL_UNSUPPORTED_DRAW pid=%ld depth_test=%d depth_write=%d stencil0=%d stencil1=%d\n",
-            (long)getpid(), dsa ? dsa->depth.enabled : 0,
-            dsa ? dsa->depth.writemask : 0,
+            (long)getpid(), dsa ? dsa->depth_enabled : 0,
+            dsa ? dsa->depth_writemask : 0,
             dsa ? dsa->stencil[0].enabled : 0,
             dsa ? dsa->stencil[1].enabled : 0);
       }
