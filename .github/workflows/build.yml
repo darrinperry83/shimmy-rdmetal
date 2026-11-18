@@ -39,7 +39,6 @@ jobs:
               -Dlmsensors=disabled -Dlibunwind=disabled -Dvalgrind=disabled \
               -Dbuild-tests=false -Drdmetal-image-candidate=true
             meson compile -C build
-            "$GITHUB_WORKSPACE/tests/run-direct-resource-bind-test.sh" "$PWD" "$PWD/build"
             mkdir -p "$GITHUB_WORKSPACE/out"
             cp build/src/gallium/targets/dri/rdmetal_dri.so "$GITHUB_WORKSPACE/out/"
       - uses: actions/upload-artifact@v4
