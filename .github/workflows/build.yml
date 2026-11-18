@@ -16,13 +16,12 @@ jobs:
         with:
           arch: aarch64
           distro: ubuntu24.04
-          githubToken: ${{ github.token }}
           install: |
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               build-essential meson ninja-build python3-mako python3-ply \
               libwayland-dev wayland-protocols libdrm-dev libexpat1-dev \
-              zlib1g-dev libzstd-dev pkg-config curl xz-utils patch
+              zlib1g-dev libzstd-dev pkg-config curl ca-certificates xz-utils patch
           run: |
             set -euo pipefail
             mkdir -p /tmp/rdmetal-mesa
