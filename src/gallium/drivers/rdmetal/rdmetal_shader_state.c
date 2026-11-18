@@ -138,7 +138,15 @@ void *rdmetal_shader_create(enum pipe_shader_type stage,
    if (getenv("RDMETAL_TRACE_SHADER")) {
       fprintf(stderr, "RDMETAL_APP_SHADER stage=%d textures=%u\n",
               (int)stage, (unsigned)nir->info.num_textures);
-      nir_print_shader(nir, stderr);
+      nir_foreach_variable_with_modes(var, nir,
+         nir_var_shader_in | nir_var_shader_out | nir_var_uniform) {
+         fprintf(stderr,
+                 "RDMETAL_APP_VAR stage=%d name=%s mode=%u loc=%d driver=%d type=%d vec=%u\n",
+                 (int)stage, var->name ? var->name : "",
+                 (unsigned)var->data.mode, var->data.location,
+                 var->data.driver_location, (int)glsl_get_base_type(var->type),
+                 glsl_get_vector_elements(var->type));
+      }
    }
    if(getenv("RDMETAL_TRACE_TEXTURE"))
       fprintf(stderr,"RDMETAL_SHADER_CREATE stage=%d num_textures=%u\n",
