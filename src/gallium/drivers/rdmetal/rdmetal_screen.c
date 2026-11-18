@@ -108,16 +108,17 @@ rdmetal_resource_get_handle(struct pipe_screen *screen, struct pipe_context *ctx
    return true;
 }
 
-/* Report dma-buf import/export capability even though the software winsys has
- * no kernel DRM fd.  The EGL DRI frontend only advertises
- * EXT_image_dma_buf_import when PIPE_CAP_DMABUF carries DRM_PRIME_CAP_IMPORT;
- * without this the compositor refuses to bind zwp_linux_dmabuf_v1.  Actual
- * import/export stays fail-closed through the shim broker. */
+/* The broker can export a producer's own carrier, but cannot yet import a
+ * different process's carrier into this Mesa screen. Do not advertise import
+ * to EGL/Wayland until the cross-process IOSurface lease path exists: a false
+ * import claim makes KWin expose zwp_linux_dmabuf_v1, then disconnect clients
+ * when their valid foreign carrier cannot be resolved. Keep export for the
+ * compositor's own GBM/scanout buffers. */
 static int
 rdmetal_get_param(struct pipe_screen *screen, enum pipe_cap param)
 {
    if (param == PIPE_CAP_DMABUF)
-      return DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
+      return DRM_PRIME_CAP_EXPORT;
    /* The direct Metal path has no GPU query/fence timestamp implementation.
     * Do not inherit softpipe's query advertisement for this context. */
    if (param == PIPE_CAP_OCCLUSION_QUERY ||
