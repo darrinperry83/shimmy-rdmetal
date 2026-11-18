@@ -25,8 +25,10 @@ jobs:
           distro: archarm_latest
           githubToken: ${{ github.token }}
           install: |
-            pacman -Syu --noconfirm
-            pacman -S --noconfirm --needed \
+            # The QEMU runner kernel lacks Landlock. The container is
+            # disposable; keep pacman's package signature checks enabled.
+            pacman -Syu --noconfirm --disable-sandbox
+            pacman -S --noconfirm --needed --disable-sandbox \
               base-devel meson ninja python python-mako \
               wayland wayland-protocols libdrm expat zlib zstd git
           run: |
