@@ -1589,7 +1589,8 @@ static void rdmetal_texture_unmap(struct pipe_context *p,
       if (transfer->level || box->x || box->y || box->z || box->depth != 1 ||
           box->width != res->width0 || box->height != res->height0 ||
           rdmetal_direct_resource_upload(transfer->resource, t->data,
-             (size_t)res->width0 * res->height0 * 4))
+             (size_t)res->width0 * res->height0 *
+                (res->format == PIPE_FORMAT_A8_UNORM ? 1u : 4u)))
          RDMETAL_FAIL(ctx);
    }
    if (transfer->resource && rdmetal_sample_resource_owns(transfer->resource)) {
@@ -1655,7 +1656,8 @@ static void rdmetal_texture_subdata(struct pipe_context *p,
    if (rdmetal_direct_resource_owns(resource)) {
       if (box->x < 0 || box->y < 0 || box->z || box->depth != 1 ||
           box->width <= 0 || box->height <= 0 ||
-          stride < (uint64_t)box->width * 4) {
+          stride < (uint64_t)box->width *
+             (resource->format == PIPE_FORMAT_A8_UNORM ? 1u : 4u)) {
          RDMETAL_FAIL(self(p));
          return;
       }

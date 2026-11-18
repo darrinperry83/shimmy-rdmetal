@@ -123,7 +123,10 @@ rdmetal_direct_resource_create(struct pipe_screen *screen,
    if (!screen || !templ || !ops || !ops->create_bgra8 || !ops->clear ||
        !ops->wait || !ops->release ||
        templ->target != PIPE_TEXTURE_2D ||
-       !rdmetal_direct_format_supported(templ->format) ||
+       !(rdmetal_direct_format_supported(templ->format) ||
+         (templ->format == PIPE_FORMAT_A8_UNORM &&
+          (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
+          !(templ->bind & PIPE_BIND_RENDER_TARGET))) ||
        !(templ->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW)) ||
        templ->last_level || templ->depth0 != 1 || templ->array_size != 1 ||
        templ->nr_samples || !templ->width0 || !templ->height0 ||
@@ -366,8 +369,13 @@ rdmetal_direct_resource_upload(struct pipe_resource *resource,
 {
    if (!resource || !pixels || !rdmetal_direct_resource_owns(resource) ||
        resource->width0 > 4096 || resource->height0 > 4096 ||
-       (uint64_t)resource->width0 * resource->height0 * 4 != bytes)
+       (uint64_t)resource->width0 * resource->height0 *
+          (resource->format == PIPE_FORMAT_A8_UNORM ? 1u : 4u) != bytes)
       return -EINVAL;
+
+   if (resource->format == PIPE_FORMAT_A8_UNORM)
+      return rdmetal_direct_resource_upload_region(resource, pixels,
+         0, 0, resource->width0, resource->height0, resource->width0);
 
    /* The broker knows this resource's exact dimensions and lease. Its upload
     * operation copies into the SAME IOSurface, never a detached sample image.
@@ -388,21 +396,41 @@ int rdmetal_direct_resource_upload_region(struct pipe_resource *resource,
                                    const void *pixels,uint32_t x,uint32_t y,
                                    uint32_t width,uint32_t height,uint32_t stride)
 {
+   const bool alpha8 = resource && resource->format == PIPE_FORMAT_A8_UNORM;
    if (!resource || !pixels || !rdmetal_direct_resource_owns(resource) ||
        !width || !height || x > resource->width0 || y > resource->height0 ||
        width > resource->width0-x || height > resource->height0-y ||
-       stride < (uint64_t)width*4) return -EINVAL;
+       stride < (uint64_t)width*(alpha8 ? 1u : 4u)) return -EINVAL;
    uint32_t format;
    switch (resource->format) {
    case PIPE_FORMAT_B8G8R8A8_UNORM: format = 1; break;
    case PIPE_FORMAT_R8G8B8A8_UNORM: format = 2; break;
    case PIPE_FORMAT_B8G8R8X8_UNORM: format = 3; break;
+   case PIPE_FORMAT_A8_UNORM: format = 2; break;
    default: return -EINVAL;
+   }
+   /* Expand an alpha-only mask for the broker's BGRA8 Metal texture. The
+    * compositor's draw itself remains on the GPU. */
+   uint8_t *expanded = NULL;
+   if (alpha8) {
+      expanded = malloc((size_t)width * height * 4u);
+      if (!expanded) return -ENOMEM;
+      const uint8_t *src = pixels;
+      for (uint32_t row = 0; row < height; row++)
+         for (uint32_t col = 0; col < width; col++) {
+            uint8_t *dst = expanded + ((size_t)row * width + col) * 4u;
+            dst[0] = dst[1] = dst[2] = 255;
+            dst[3] = src[(size_t)row * stride + col];
+         }
+      pixels = expanded;
+      stride = width * 4u;
    }
    long result = syscall(0x2002L,15L,
        rdmetal_direct_resource_handle(resource),(long)pixels,
        (long)(((uint64_t)x<<32)|y),
        (long)(((uint64_t)width<<32)|height),
        (long)(((uint64_t)format<<32)|stride));
-   return result == 0 ? 0 : result == -1 ? -errno : -EIO;
+   int saved_errno = errno;
+   free(expanded);
+   return result == 0 ? 0 : result == -1 ? -saved_errno : -EIO;
 }

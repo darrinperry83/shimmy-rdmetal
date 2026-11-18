@@ -294,7 +294,10 @@ rdmetal_resource_create(struct pipe_screen *screen,
        * framebuffer, and a detached sample upload cannot be rendered into.
        * The direct IOSurface accepts both uses and op14 uploads into it. */
       if (templ->target == PIPE_TEXTURE_2D &&
-          rdmetal_direct_format_supported(templ->format) &&
+          (rdmetal_direct_format_supported(templ->format) ||
+           (templ->format == PIPE_FORMAT_A8_UNORM &&
+            (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
+            !(templ->bind & PIPE_BIND_RENDER_TARGET))) &&
           (templ->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW)) &&
           !templ->last_level && templ->depth0 == 1 &&
           templ->array_size == 1 && !templ->nr_samples &&
