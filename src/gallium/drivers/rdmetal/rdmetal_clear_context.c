@@ -1293,8 +1293,8 @@ static void rdmetal_set_framebuffer(struct pipe_context *context,
          fb->cbufs[0]->texture : NULL;
       const struct pipe_resource *depth = fb && fb->zsbuf ? fb->zsbuf->texture : NULL;
       fprintf(stderr,
-         "rdmetal: unsupported framebuffer colors=%u color_fmt=%d color_bind=%u color_direct=%d depth_fmt=%d depth_bind=%u samples=%u\n",
-         fb ? fb->nr_cbufs : 0, color ? (int)color->format : -1,
+         "rdmetal: unsupported framebuffer pid=%ld colors=%u color_fmt=%d color_bind=%u color_direct=%d depth_fmt=%d depth_bind=%u samples=%u\n",
+         (long)getpid(), fb ? fb->nr_cbufs : 0, color ? (int)color->format : -1,
          color ? color->bind : 0,
          color ? (int)rdmetal_direct_resource_owns(color) : 0,
          depth ? (int)depth->format : -1, depth ? depth->bind : 0,
