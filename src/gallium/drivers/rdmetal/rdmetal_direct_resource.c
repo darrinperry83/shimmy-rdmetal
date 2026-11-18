@@ -205,10 +205,13 @@ rdmetal_direct_resource_hold_for_import(struct pipe_resource *resource)
 struct pipe_resource *
 rdmetal_direct_resource_find(struct pipe_screen *screen, long handle)
 {
+   (void)screen;
    pthread_mutex_lock(&rdmetal_resource_lock);
    struct rdmetal_direct_resource *node = rdmetal_resources;
-   while (node && (node->broker_handle != handle ||
-                   node->base.screen != screen))
+   /* EGL can re-import an exported GBM image through a different pipe_screen
+    * wrapper in this process. The broker handle is already unique per guest
+    * process; requiring pointer-identical screens broke that valid import. */
+   while (node && node->broker_handle != handle)
       node = node->next;
    struct pipe_resource *found = node ? &node->base : NULL;
    if (found) {
