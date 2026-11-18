@@ -53,11 +53,13 @@ static bool rdmetal_get_query_result(struct pipe_context *pipe,
 struct rdmetal_clear_context {
    struct pipe_context base;
    struct pipe_surface *color;
+   struct pipe_surface *depth;
    enum rdmetal_framebuffer_route framebuffer_route;
    bool warned_unsupported_draw;
    bool warned_unsupported_draw_use;
    bool warned_unsupported_clear_use;
    long producer_fence;
+   long depth_fence;
    long draw_fences[8];
    unsigned draw_fence_count;
    bool failed;
@@ -105,7 +107,7 @@ static long rdmetal_draw_guest_submit(void *opaque,const void *packet,size_t byt
    (void)opaque;
    const struct rdmetal_draw_header *header=packet;
    if(!packet||bytes<sizeof(*header)||
-      bytes>sizeof(struct rdmetal_draw_header_v4)+2u*RDMETAL_DRAW_MAX_SHADER_WORDS*4u+
+      bytes>sizeof(struct rdmetal_draw_header_v5)+2u*RDMETAL_DRAW_MAX_SHADER_WORDS*4u+
             RDMETAL_DRAW_MAX_VERTEX_BYTES+RDMETAL_DRAW_MAX_INDEX_BYTES+
             RDMETAL_DRAW_MAX_UNIFORM_BYTES||
       header->total_bytes!=bytes||!header->target_handle)return -EINVAL;
@@ -133,9 +135,12 @@ static long rdmetal_draw_mock_submit(void *opaque,const void *packet,size_t byte
    if (h->version == RDMETAL_DRAW_VERSION_TEXTURE)
       prefix = sizeof(struct rdmetal_draw_header_v2);
    else if (h->version == RDMETAL_DRAW_VERSION_V3 ||
-            h->version == RDMETAL_DRAW_VERSION_V4) {
+            h->version == RDMETAL_DRAW_VERSION_V4 ||
+            h->version == RDMETAL_DRAW_VERSION_V5) {
       const struct rdmetal_draw_header_v3 *v3 = packet;
-      prefix = h->version == RDMETAL_DRAW_VERSION_V4 ?
+      prefix = h->version == RDMETAL_DRAW_VERSION_V5 ?
+         sizeof(struct rdmetal_draw_header_v5) :
+         h->version == RDMETAL_DRAW_VERSION_V4 ?
          sizeof(struct rdmetal_draw_header_v4) : sizeof(*v3);
       extra = (size_t)v3->index_count *
          (v3->index_type==RDMETAL_DRAW_INDEX_U16 ? 2u :
@@ -716,7 +721,8 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
       }
    }
    size_t index_bytes = indexed ? (size_t)index_count * index_size : 0;
-   const size_t header_bytes = sizeof(struct rdmetal_draw_header_v4);
+   const size_t header_bytes = ctx->depth ?
+      sizeof(struct rdmetal_draw_header_v5) : sizeof(struct rdmetal_draw_header_v4);
    size_t bytes = header_bytes +
                   (vs_count+fs_count)*sizeof(uint32_t) + vertex_bytes +
                   index_bytes + 0u /* uniform_bytes=0 */;
@@ -728,7 +734,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    struct rdmetal_draw_header *wire=calloc(1,bytes);
    if(!wire){free(out_vertices);RDMETAL_FAIL(ctx);return;}
    wire->magic=RDMETAL_DRAW_MAGIC;
-   wire->version=RDMETAL_DRAW_VERSION_V4;
+   wire->version=ctx->depth ? RDMETAL_DRAW_VERSION_V5 : RDMETAL_DRAW_VERSION_V4;
    wire->total_bytes=(uint32_t)bytes;wire->target_handle=handle;
    wire->target_width=ctx->color->width;wire->target_height=ctx->color->height;
    wire->vertex_count=triangle_count;
@@ -752,6 +758,20 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    v4->scissor_y=sy;
    v4->scissor_width=ex-sx;
    v4->scissor_height=ey-sy;
+   if(ctx->depth){
+      const struct pipe_depth_stencil_alpha_state *dsa=ctx->depth_stencil_alpha;
+      if(dsa&&(dsa->stencil[0].enabled||dsa->stencil[1].enabled)){
+         free(out_vertices);free(wire);RDMETAL_FAIL(ctx);return;
+      }
+      struct rdmetal_draw_header_v5 *v5=(void *)wire;
+      v5->depth_handle=rdmetal_depth_resource_handle(ctx->depth->texture);
+      v5->depth_flags=dsa?((dsa->depth_enabled?1u:0u)|
+                             (dsa->depth_writemask?2u:0u)):0;
+      v5->depth_compare=dsa?dsa->depth_func:PIPE_FUNC_ALWAYS;
+      if(!v5->depth_handle||v5->depth_compare>PIPE_FUNC_ALWAYS){
+         free(out_vertices);free(wire);RDMETAL_FAIL(ctx);return;
+      }
+   }
    uint8_t *payload=(uint8_t *)wire+header_bytes;
    memcpy(payload,vs,vs_count*sizeof(uint32_t));
    payload+=vs_count*sizeof(uint32_t);
@@ -1190,7 +1210,7 @@ static struct rdmetal_clear_context *self(struct pipe_context *context)
 
 static bool rdmetal_wait(struct rdmetal_clear_context *ctx)
 {
-   if(!ctx->producer_fence&&!ctx->draw_fence_count)return true;
+   if(!ctx->producer_fence&&!ctx->depth_fence&&!ctx->draw_fence_count)return true;
    if(!ctx->color){RDMETAL_FAIL(ctx);return false;}
    const long handle=rdmetal_direct_resource_handle(ctx->color->texture);
    if(!handle||!ctx->draw_poll){RDMETAL_FAIL(ctx);return false;}
@@ -1203,6 +1223,13 @@ static bool rdmetal_wait(struct rdmetal_clear_context *ctx)
          if(status==0)ctx->producer_fence=0;
          else if(status==-EAGAIN)pending=true;
          else {if(getenv("RDMETAL_TRACE_DRAW"))fprintf(stderr,"RDMETAL_WAIT_CLEAR_FAILED status=%d fence=%ld\n",status,ctx->producer_fence);RDMETAL_FAIL(ctx);return false;}
+      }
+      if(ctx->depth_fence){
+         int status=ctx->depth?
+            rdmetal_depth_resource_wait(ctx->depth->texture,ctx->depth_fence):-EINVAL;
+         if(status==0)ctx->depth_fence=0;
+         else if(status==-EAGAIN)pending=true;
+         else {RDMETAL_FAIL(ctx);return false;}
       }
       for(unsigned i=0;i<ctx->draw_fence_count;i++)if(ctx->draw_fences[i]){
          int status=ctx->draw_poll(ctx->poll_opaque,handle,ctx->draw_fences[i]);
@@ -1229,7 +1256,10 @@ static void rdmetal_destroy_context(struct pipe_context *context)
       if (!ctx->vertex_buffers[i].is_user_buffer)
          pipe_resource_reference(&ctx->vertex_buffers[i].buffer.resource,NULL);
    pipe_resource_reference(&ctx->vs_const.buffer,NULL);
-   if(rdmetal_wait(ctx))pipe_surface_reference(&ctx->color,NULL);
+   if(rdmetal_wait(ctx)){
+      pipe_surface_reference(&ctx->color,NULL);
+      pipe_surface_reference(&ctx->depth,NULL);
+   }
    pipe_sampler_view_reference(&ctx->fragment_view,NULL);
    /* ctx->softpipe is the shared fallback context owned by the screen, not by
     * this direct context; it is destroyed by rdmetal_screen_destroy(). */
@@ -1247,7 +1277,8 @@ static struct pipe_surface *rdmetal_create_surface(
    /* Non-direct resources (float/depth/stencil/unsupported formats) get a real
     * softpipe surface so gles_check_float_renderable and friends never see a
     * NULL renderbuffer. */
-   if(!resource || !rdmetal_direct_resource_owns(resource)) {
+   if(!resource || (!rdmetal_direct_resource_owns(resource)&&
+                    !rdmetal_depth_resource_owns(resource))) {
       if (ctx->softpipe && resource &&
           !rdmetal_sample_resource_owns(resource) &&
           !rdmetal_cpu_buffer_owns(resource))
@@ -1257,7 +1288,9 @@ static struct pipe_surface *rdmetal_create_surface(
       return NULL;
    }
    if(!templ||
-      !rdmetal_direct_format_supported(resource->format)||
+      !(rdmetal_direct_format_supported(resource->format)||
+        (rdmetal_depth_resource_owns(resource)&&
+         resource->format==PIPE_FORMAT_Z24_UNORM_S8_UINT))||
       templ->format!=resource->format||templ->u.tex.level||
       templ->u.tex.first_layer||templ->u.tex.last_layer)
       return NULL;
@@ -1286,6 +1319,7 @@ static void rdmetal_set_framebuffer(struct pipe_context *context,
    struct rdmetal_clear_context *ctx=self(context);
    if(!rdmetal_wait(ctx))return;
    pipe_surface_reference(&ctx->color,NULL);
+   pipe_surface_reference(&ctx->depth,NULL);
    ctx->framebuffer_route = rdmetal_framebuffer_route(fb);
    if (getenv("RDMETAL_TRACE_DRAW")) {
       const struct pipe_resource *color = fb && fb->nr_cbufs && fb->cbufs[0] ?
@@ -1314,8 +1348,10 @@ static void rdmetal_set_framebuffer(struct pipe_context *context,
          fb ? fb->samples : 0);
       ctx->warned_unsupported_draw = true;
    }
-   if (ctx->framebuffer_route == RDMETAL_FB_DIRECT)
+   if (ctx->framebuffer_route == RDMETAL_FB_DIRECT){
       pipe_surface_reference(&ctx->color, fb->cbufs[0]);
+      if(fb->zsbuf)pipe_surface_reference(&ctx->depth,fb->zsbuf);
+   }
    else if (ctx->softpipe) {
       /* An unsupported mixed FBO must not draw into the previous softpipe FBO. */
       struct pipe_framebuffer_state empty = {0};
@@ -1348,11 +1384,23 @@ static void rdmetal_clear(struct pipe_context *context,unsigned buffers,
       return;
    }
    if(!rdmetal_wait(ctx))return;
-   if(ctx->failed||!color||scissor||buffers!=PIPE_CLEAR_COLOR0){
+   if(ctx->failed||scissor||!buffers||
+      (buffers&~(PIPE_CLEAR_COLOR0|PIPE_CLEAR_DEPTH|PIPE_CLEAR_STENCIL))||
+      ((buffers&PIPE_CLEAR_COLOR0)&&!color)||
+      ((buffers&(PIPE_CLEAR_DEPTH|PIPE_CLEAR_STENCIL))&&!ctx->depth)){
       RDMETAL_FAIL(ctx);return;
    }
-   ctx->producer_fence=rdmetal_direct_resource_clear_rgba(ctx->color->texture,color->f);
-   if(ctx->producer_fence<=0)RDMETAL_FAIL(ctx);
+   if(buffers&(PIPE_CLEAR_DEPTH|PIPE_CLEAR_STENCIL)){
+      uint32_t mask=((buffers&PIPE_CLEAR_DEPTH)?1u:0u)|
+                    ((buffers&PIPE_CLEAR_STENCIL)?2u:0u);
+      ctx->depth_fence=rdmetal_depth_resource_clear(ctx->depth->texture,
+                                                    (float)depth,stencil,mask);
+      if(ctx->depth_fence<=0||!rdmetal_wait(ctx)){RDMETAL_FAIL(ctx);return;}
+   }
+   if(buffers&PIPE_CLEAR_COLOR0){
+      ctx->producer_fence=rdmetal_direct_resource_clear_rgba(ctx->color->texture,color->f);
+      if(ctx->producer_fence<=0)RDMETAL_FAIL(ctx);
+   }
 }
 
 static void rdmetal_flush(struct pipe_context *context,
@@ -1402,6 +1450,7 @@ static bool rdmetal_is_softpipe_resource(const struct pipe_resource *resource)
 {
    return resource &&
       !rdmetal_direct_resource_owns(resource) &&
+      !rdmetal_depth_resource_owns(resource) &&
       !rdmetal_sample_resource_owns(resource) &&
       !rdmetal_cpu_buffer_owns(resource);
 }
@@ -1416,6 +1465,9 @@ static void *rdmetal_texture_map(struct pipe_context *p,
    if (!resource || !box || !out) {
       RDMETAL_FAIL(ctx);
       return NULL;
+   }
+   if(rdmetal_depth_resource_owns(resource)){
+      RDMETAL_FAIL(ctx);return NULL; /* no verified depth readback/upload */
    }
    /* Delegate softpipe resources to the fallback context so their real CPU
     * pixel storage is mapped. On any failure (or when the hybrid fallback is

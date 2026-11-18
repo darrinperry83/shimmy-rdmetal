@@ -164,6 +164,16 @@ rdmetal_broker_release(long handle)
 {
    return (int)syscall(0x2002L, 4L, handle, 0L, 0L, 0L, 0L);
 }
+static long rdmetal_broker_create_depth(unsigned width,unsigned height)
+{
+   return syscall(0x2002L,17L,(long)width,(long)height,0L,0L,0L);
+}
+static long rdmetal_broker_clear_depth(long handle,uint32_t depth_bits,
+                                       uint32_t stencil,uint32_t mask)
+{
+   return syscall(0x2002L,16L,handle,(long)depth_bits,(long)stencil,
+                  (long)mask,0L);
+}
 
 static long
 rdmetal_broker_clear(long handle, uint64_t rgba16)
@@ -179,7 +189,8 @@ rdmetal_broker_wait(long handle, long fence)
 
 static const struct rdmetal_direct_ops rdmetal_broker_ops = {
    rdmetal_broker_create, rdmetal_broker_clear,
-   rdmetal_broker_wait, rdmetal_broker_release
+   rdmetal_broker_wait, rdmetal_broker_release,
+   rdmetal_broker_create_depth,rdmetal_broker_clear_depth
 };
 
 /* Isolated ordinary-EGL callback probe. This mock never performs GPU work and
@@ -274,6 +285,9 @@ rdmetal_resource_create(struct pipe_screen *screen,
    if (rdmetal_direct_mode && templ->target == PIPE_BUFFER)
       return rdmetal_cpu_buffer_create(screen, templ);
    if (rdmetal_direct_mode) {
+      if (templ->format==PIPE_FORMAT_Z24_UNORM_S8_UINT &&
+          (templ->bind&PIPE_BIND_DEPTH_STENCIL))
+         return rdmetal_depth_resource_create(screen,templ,&rdmetal_broker_ops);
       /* st/mesa gives both an ordinary uploaded RGBA8 texture and an FBO
        * colour attachment bind=SAMPLER_VIEW|RENDER_TARGET. They must share a
        * resource representation: a sampled-only allocation cannot become a
@@ -309,6 +323,9 @@ rdmetal_resource_create(struct pipe_screen *screen,
 static void
 rdmetal_resource_destroy(struct pipe_screen *screen, struct pipe_resource *res)
 {
+   if(rdmetal_depth_resource_owns(res)){
+      rdmetal_depth_resource_destroy(res);return;
+   }
    if (rdmetal_direct_mode && rdmetal_direct_resource_owns(res)) {
       rdmetal_direct_resource_destroy(res);
       return;

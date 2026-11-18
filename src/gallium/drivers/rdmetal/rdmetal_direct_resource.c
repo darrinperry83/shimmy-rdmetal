@@ -19,8 +19,82 @@ struct rdmetal_direct_resource {
    bool exported;
    bool pending_fd_import;
 };
+struct rdmetal_depth_resource {
+   struct pipe_resource base;
+   long broker_handle;
+   long (*clear)(long,uint32_t,uint32_t,uint32_t);
+   int (*wait)(long,long);
+   int (*release)(long);
+   struct rdmetal_depth_resource *next;
+};
 static pthread_mutex_t rdmetal_resource_lock=PTHREAD_MUTEX_INITIALIZER;
 static struct rdmetal_direct_resource *rdmetal_resources;
+static struct rdmetal_depth_resource *rdmetal_depth_resources;
+
+bool rdmetal_depth_resource_owns(const struct pipe_resource *resource)
+{
+   pthread_mutex_lock(&rdmetal_resource_lock);
+   struct rdmetal_depth_resource *node=rdmetal_depth_resources;
+   while(node&&&node->base!=resource)node=node->next;
+   pthread_mutex_unlock(&rdmetal_resource_lock);
+   return node!=NULL;
+}
+
+struct pipe_resource *rdmetal_depth_resource_create(
+   struct pipe_screen *screen,const struct pipe_resource *templ,
+   const struct rdmetal_direct_ops *ops)
+{
+   if(!screen||!templ||!ops||!ops->create_depth||!ops->clear_depth||
+      !ops->wait||!ops->release||templ->target!=PIPE_TEXTURE_2D||
+      templ->format!=PIPE_FORMAT_Z24_UNORM_S8_UINT||
+      !(templ->bind&PIPE_BIND_DEPTH_STENCIL)||templ->last_level||
+      templ->depth0!=1||templ->array_size!=1||templ->nr_samples||
+      !templ->width0||!templ->height0||templ->width0>4096||
+      templ->height0>4096)return NULL;
+   long handle=ops->create_depth(templ->width0,templ->height0);
+   if(handle<=0)return NULL;
+   struct rdmetal_depth_resource *res=calloc(1,sizeof *res);
+   if(!res){ops->release(handle);return NULL;}
+   res->base=*templ;pipe_reference_init(&res->base.reference,1);
+   res->base.screen=screen;res->broker_handle=handle;
+   res->clear=ops->clear_depth;res->wait=ops->wait;res->release=ops->release;
+   pthread_mutex_lock(&rdmetal_resource_lock);
+   res->next=rdmetal_depth_resources;rdmetal_depth_resources=res;
+   pthread_mutex_unlock(&rdmetal_resource_lock);
+   return &res->base;
+}
+
+long rdmetal_depth_resource_handle(const struct pipe_resource *resource)
+{
+   if(!resource||!rdmetal_depth_resource_owns(resource))return 0;
+   return ((const struct rdmetal_depth_resource *)resource)->broker_handle;
+}
+long rdmetal_depth_resource_clear(struct pipe_resource *resource,
+                                  float depth,uint32_t stencil,uint32_t mask)
+{
+   if(!resource||!rdmetal_depth_resource_owns(resource))return 0;
+   uint32_t bits;memcpy(&bits,&depth,sizeof bits);
+   struct rdmetal_depth_resource *res=(void *)resource;
+   return res->clear(res->broker_handle,bits,stencil,mask);
+}
+int rdmetal_depth_resource_wait(struct pipe_resource *resource,long fence)
+{
+   if(!resource||!rdmetal_depth_resource_owns(resource))return -EINVAL;
+   struct rdmetal_depth_resource *res=(void *)resource;
+   return res->wait(res->broker_handle,fence);
+}
+void rdmetal_depth_resource_destroy(struct pipe_resource *resource)
+{
+   if(!resource)return;
+   pthread_mutex_lock(&rdmetal_resource_lock);
+   struct rdmetal_depth_resource **link=&rdmetal_depth_resources;
+   while(*link&&&(*link)->base!=resource)link=&(*link)->next;
+   struct rdmetal_depth_resource *res=*link;
+   if(res&&res->release(res->broker_handle)==0)*link=res->next;
+   else res=NULL;
+   pthread_mutex_unlock(&rdmetal_resource_lock);
+   free(res);
+}
 static unsigned rdmetal_pending_imports;
 static uint64_t rdmetal_pending_bytes;
 #define RDMETAL_MAX_PENDING_IMPORTS 8u

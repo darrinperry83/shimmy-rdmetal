@@ -12,7 +12,20 @@ struct rdmetal_direct_ops {
    long (*clear)(long handle, uint64_t rgba16);
    int (*wait)(long handle, long fence);
    int (*release)(long handle);
+   long (*create_depth)(unsigned width,unsigned height);
+   long (*clear_depth)(long handle,uint32_t depth_bits,
+                       uint32_t stencil,uint32_t mask);
 };
+
+struct pipe_resource *rdmetal_depth_resource_create(
+   struct pipe_screen *screen,const struct pipe_resource *templ,
+   const struct rdmetal_direct_ops *ops);
+bool rdmetal_depth_resource_owns(const struct pipe_resource *resource);
+long rdmetal_depth_resource_handle(const struct pipe_resource *resource);
+long rdmetal_depth_resource_clear(struct pipe_resource *resource,
+                                  float depth,uint32_t stencil,uint32_t mask);
+int rdmetal_depth_resource_wait(struct pipe_resource *resource,long fence);
+void rdmetal_depth_resource_destroy(struct pipe_resource *resource);
 
 /* The compositor renders into RGBA8 (glTexImage GL_RGBA) and scans out
  * XRGB8888 (DRM XR24) GBM buffers; the broker IOSurface is always BGRA8, so
