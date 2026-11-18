@@ -8,23 +8,17 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - name: Build Mesa driver on aarch64
-        uses: uraimo/run-on-arch-action@v3
-        with:
-          arch: aarch64
-          distro: ubuntu24.04
-          install: |
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        run: |
+            sudo apt-get update
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               build-essential meson ninja-build python3-mako python3-ply \
               libwayland-dev libwayland-egl-backend-dev wayland-protocols \
-              libdrm-dev libexpat1-dev \
-              zlib1g-dev libzstd-dev libudev-dev libelf-dev \
-              bison flex pkg-config curl ca-certificates xz-utils patch
-          run: |
+              libdrm-dev libexpat1-dev zlib1g-dev libzstd-dev libudev-dev \
+              libelf-dev bison flex pkg-config curl ca-certificates xz-utils patch
             set -euo pipefail
             mkdir -p /tmp/rdmetal-mesa
             cd /tmp/rdmetal-mesa
