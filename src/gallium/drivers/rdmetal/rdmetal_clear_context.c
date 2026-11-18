@@ -466,6 +466,11 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
               info?(info->has_user_indices?1:0):0,info?info->index_size:0,
               ve?(int)ve->element[0].src_format:0,ve?ve->element[0].src_stride:0,
               ve?ve->count:0);
+   if(getenv("RDMETAL_TRACE_DRAW"))
+      fprintf(stderr,"RDMETAL_VIEWPORT have=%d scale=%g,%g translate=%g,%g target=%ux%u\n",
+              ctx->have_viewport,ctx->viewport.scale[0],ctx->viewport.scale[1],
+              ctx->viewport.translate[0],ctx->viewport.translate[1],
+              ctx->color?ctx->color->width:0,ctx->color?ctx->color->height:0);
    if(ctx->failed||!ctx->draw_submit||!ctx->color||
       !ve||!vs||!fs||!info||!draws||indirect||
       drawid_offset||num_draws!=1||(!triangles&&!strip&&!fan)||
@@ -641,8 +646,24 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
       const float px = sp[pos_offset/4 + 0];
       const float py = sp[pos_offset/4 + 1];
       const float pz = pos_floats==3 ? sp[pos_offset/4 + 2] : 0.0f;
-      dp[0] = m[0]*px + m[4]*py + m[8]*pz  + m[12];
-      dp[1] = m[1]*px + m[5]*py + m[9]*pz  + m[13];
+      const float clip_x = m[0]*px + m[4]*py + m[8]*pz  + m[12];
+      const float clip_y = m[1]*px + m[5]*py + m[9]*pz  + m[13];
+      /* Gallium's viewport maps clip coordinates into framebuffer pixels.
+       * Metal's target has a top-left pixel origin.  Forwarding the GL clip
+       * Y directly skipped that transform and vertically mirrored Linux
+       * compositor clients.  Apply the supplied viewport, then convert the
+       * framebuffer pixel back to Metal's clip convention. */
+      if (ctx->have_viewport && ctx->color->width && ctx->color->height) {
+         const float window_x = clip_x * ctx->viewport.scale[0] +
+                                ctx->viewport.translate[0];
+         const float window_y = clip_y * ctx->viewport.scale[1] +
+                                ctx->viewport.translate[1];
+         dp[0] = 2.0f * window_x / ctx->color->width - 1.0f;
+         dp[1] = 1.0f - 2.0f * window_y / ctx->color->height;
+      } else {
+         dp[0] = clip_x;
+         dp[1] = clip_y;
+      }
       dp[2] = m[2]*px + m[6]*py + m[10]*pz + m[14];
       if (has_uv) {
          const float *uv = (const float *)(src_uv_vertices + (size_t)src_idx * uv_stride + uv_offset);
