@@ -533,11 +533,25 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    uint32_t min_index = UINT32_MAX;
    if (indexed) {
       if (index_size != 2 && index_size != 4) { RDMETAL_FAIL(ctx); return; }
-      if (strip || fan) { RDMETAL_FAIL(ctx); return; }
+      if (fan) { RDMETAL_FAIL(ctx); return; }
       index_type = index_size==2 ? RDMETAL_DRAW_INDEX_U16 : RDMETAL_DRAW_INDEX_U32;
-      index_count = draws[0].count;
-      if (!index_count || (index_count % 3)) { RDMETAL_FAIL(ctx); return; }
-      size_t index_bytes = (size_t)index_count * index_size;
+      const unsigned source_index_count = draws[0].count;
+      if (strip ? source_index_count < 3 :
+          (!source_index_count || source_index_count % 3)) {
+         RDMETAL_FAIL(ctx); return;
+      }
+      if (strip && source_index_count > 65535u / 3u + 2u) {
+         RDMETAL_FAIL(ctx); return;
+      }
+      /* Metal's wire protocol carries triangle lists. Expand an indexed
+       * strip with alternating winding, retaining the source index buffer
+       * until the packet is assembled below. */
+      index_count = strip ? (source_index_count - 2u) * 3u : source_index_count;
+      if (index_count > 65535u ||
+          (size_t)index_count * index_size > RDMETAL_DRAW_MAX_INDEX_BYTES) {
+         RDMETAL_FAIL(ctx); return;
+      }
+      size_t index_bytes = (size_t)source_index_count * index_size;
       size_t index_offset = (size_t)draws[0].start * index_size;
       if (index_bytes > RDMETAL_DRAW_MAX_INDEX_BYTES ||
           index_offset > RDMETAL_DRAW_MAX_INDEX_BYTES - index_bytes) {
@@ -551,7 +565,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
                                                index_offset, index_bytes);
       }
       if (!index_data) { RDMETAL_FAIL(ctx); return; }
-      for (unsigned i=0;i<index_count;i++) {
+      for (unsigned i=0;i<source_index_count;i++) {
          uint32_t value;
          if (index_size == 2) {
             uint16_t v; memcpy(&v,index_data+(size_t)i*2,2); value=v;
@@ -590,7 +604,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
                          (int64_t)draws[0].start + draws[0].count - 1;
    if (source_max < 0 || source_max > 65535) { RDMETAL_FAIL(ctx); return; }
    if (triangles && (draws[0].count % 3)) { RDMETAL_FAIL(ctx); return; }
-   if ((strip || fan) && source_count < 3) { RDMETAL_FAIL(ctx); return; }
+   if ((strip || fan) && draws[0].count < 3) { RDMETAL_FAIL(ctx); return; }
    const unsigned triangle_count = indexed ? index_count :
                                   (strip || fan) ? (source_count - 2) * 3 : source_count;
    if (triangle_count > 65535) { RDMETAL_FAIL(ctx); return; }
@@ -795,7 +809,21 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    payload+=fs_count*sizeof(uint32_t);
    memcpy(payload,out_vertices,vertex_bytes);
    payload+=vertex_bytes;
-   if(indexed){ memcpy(payload,index_data,index_bytes); }
+   if(indexed){
+      if(strip){
+         for(unsigned tri=0;tri<draws[0].count-2u;tri++){
+            const unsigned first=(tri&1u)?tri+1u:tri;
+            const unsigned second=(tri&1u)?tri:tri+1u;
+            const unsigned source_indices[3]={first,second,tri+2u};
+            for(unsigned corner=0;corner<3;corner++)
+               memcpy(payload+((size_t)tri*3u+corner)*index_size,
+                      index_data+(size_t)source_indices[corner]*index_size,
+                      index_size);
+         }
+      }else{
+         memcpy(payload,index_data,index_bytes);
+      }
+   }
    if(getenv("RDMETAL_TRACE_DRAW"))
       fprintf(stderr,"RDMETAL_DRAW_PACKET v4 textured=%d th=%llu tg=%llu target=%llu bytes=%zu vs=%zu fs=%zu idx=%u uv=%d scissor=%u,%u %ux%u\n",
               textured,(unsigned long long)texture_handle,(unsigned long long)texture_generation,
