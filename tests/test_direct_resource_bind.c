@@ -74,12 +74,16 @@ int main(void)
    assert(releases == before + 1);
    assert(!rdmetal_direct_resource_owns(res));
    struct pipe_screen other_screen = {0};
-   spec.bind = PIPE_BIND_SAMPLER_VIEW;
+   spec.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
    struct pipe_resource *foreign =
       rdmetal_direct_resource_adopt(&other_screen, &spec, &ops, 17);
    assert(foreign && rdmetal_direct_resource_owns(foreign));
    assert(rdmetal_direct_resource_handle(foreign) == 17);
-   assert(!rdmetal_direct_resource_find(&screen, 17));
+   /* EGL can re-import through another pipe_screen wrapper; its handle still
+    * identifies the same process-local broker resource. */
+   struct pipe_resource *cross_screen = rdmetal_direct_resource_find(&screen, 17);
+   assert(cross_screen == foreign);
+   assert(!pipe_reference(&cross_screen->reference, NULL));
    struct pipe_resource *found = rdmetal_direct_resource_find(&other_screen, 17);
    assert(found == foreign);
    assert(!pipe_reference(&found->reference, NULL));

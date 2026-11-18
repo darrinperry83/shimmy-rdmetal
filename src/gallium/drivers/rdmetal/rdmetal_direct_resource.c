@@ -89,7 +89,6 @@ rdmetal_direct_resource_adopt(struct pipe_screen *screen,
        !ops->release || handle <= 0 || templ->target != PIPE_TEXTURE_2D ||
        !rdmetal_direct_format_supported(templ->format) ||
        !(templ->bind & PIPE_BIND_SAMPLER_VIEW) ||
-       (templ->bind & PIPE_BIND_RENDER_TARGET) ||
        templ->last_level || templ->depth0 != 1 || templ->array_size != 1 ||
        templ->nr_samples || !templ->width0 || !templ->height0 ||
        templ->width0 > 4096 || templ->height0 > 4096)
@@ -103,8 +102,10 @@ rdmetal_direct_resource_adopt(struct pipe_screen *screen,
    res->clear = ops->clear;
    res->wait = ops->wait;
    res->release = ops->release;
-   /* A client's imported buffer can be sampled, never re-exported or used as
-    * a compositor render target. The host guest slot enforces the same rule. */
+   /* EGL asks for both SAMPLER_VIEW and RENDER_TARGET when importing a client
+    * dma-buf. The bind bits describe Mesa's view requirements, not authority
+    * to write. The guest slot marks this lease exported/read-only, and the
+    * broker rejects CLEAR/DRAW against it regardless of those bind bits. */
    res->exported = true;
    pthread_mutex_lock(&rdmetal_resource_lock);
    res->next = rdmetal_resources;
