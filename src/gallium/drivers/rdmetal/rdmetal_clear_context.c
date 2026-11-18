@@ -55,6 +55,8 @@ struct rdmetal_clear_context {
    struct pipe_surface *color;
    enum rdmetal_framebuffer_route framebuffer_route;
    bool warned_unsupported_draw;
+   bool warned_unsupported_draw_use;
+   bool warned_unsupported_clear_use;
    long producer_fence;
    long draw_fences[8];
    unsigned draw_fence_count;
@@ -410,6 +412,17 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
 {
    struct rdmetal_clear_context *ctx=self(p);
    if (ctx->framebuffer_route != RDMETAL_FB_DIRECT) {
+      if (ctx->framebuffer_route == RDMETAL_FB_UNSUPPORTED &&
+          !ctx->warned_unsupported_draw_use) {
+         ctx->warned_unsupported_draw_use = true;
+         const struct pipe_depth_stencil_alpha_state *dsa = ctx->depth_stencil_alpha;
+         fprintf(stderr,
+            "RDMETAL_UNSUPPORTED_DRAW pid=%ld depth_test=%d depth_write=%d stencil0=%d stencil1=%d\n",
+            (long)getpid(), dsa ? dsa->depth.enabled : 0,
+            dsa ? dsa->depth.writemask : 0,
+            dsa ? dsa->stencil[0].enabled : 0,
+            dsa ? dsa->stencil[1].enabled : 0);
+      }
       bool safe = ctx->framebuffer_route == RDMETAL_FB_SOFTPIPE && ctx->softpipe;
       for (unsigned i=0;i<2;i++)
          if (!ctx->vertex_buffers[i].is_user_buffer &&
@@ -1322,6 +1335,12 @@ static void rdmetal_clear(struct pipe_context *context,unsigned buffers,
    /* No direct colour surface means the current framebuffer is non-direct:
     * clear it on the CPU via softpipe. */
    if(ctx->framebuffer_route != RDMETAL_FB_DIRECT){
+      if (ctx->framebuffer_route == RDMETAL_FB_UNSUPPORTED &&
+          !ctx->warned_unsupported_clear_use) {
+         ctx->warned_unsupported_clear_use = true;
+         fprintf(stderr, "RDMETAL_UNSUPPORTED_CLEAR pid=%ld buffers=%u\n",
+                 (long)getpid(), buffers);
+      }
       if (ctx->framebuffer_route == RDMETAL_FB_SOFTPIPE && ctx->softpipe)
          {
             RDMETAL_SP_LOCK(); ctx->softpipe->clear(ctx->softpipe, buffers, scissor, color, depth, stencil); RDMETAL_SP_UNLOCK();
