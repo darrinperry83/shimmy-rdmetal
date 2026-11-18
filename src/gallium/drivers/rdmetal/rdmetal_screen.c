@@ -242,6 +242,11 @@ rdmetal_resource_from_handle(struct pipe_screen *screen,
                        fd, handle);
             return foreign;
          }
+         fprintf(stderr,
+                 "RDMESA_DMABUF_ADOPT_REJECT fd=%d handle=%ld target=%u format=%u bind=%u size=%ux%u depth=%u array=%u level=%u samples=%u\n",
+                 fd, handle, templ->target, templ->format, templ->bind,
+                 templ->width0, templ->height0, templ->depth0,
+                 templ->array_size, templ->last_level, templ->nr_samples);
          syscall(0x2002L, 4L, handle, 0L, 0L, 0L, 0L);
       }
       if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
