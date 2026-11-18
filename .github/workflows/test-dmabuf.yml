@@ -1,0 +1,53 @@
+name: Test dma-buf capability
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Mesa driver on aarch64
+        uses: uraimo/run-on-arch-action@v3
+        with:
+          arch: aarch64
+          distro: ubuntu24.04
+          githubToken: ${{ github.token }}
+          install: |
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              build-essential meson ninja-build python3-mako python3-ply \
+              libwayland-dev wayland-protocols libdrm-dev libexpat1-dev \
+              zlib1g-dev libzstd-dev pkg-config curl xz-utils patch
+          run: |
+            set -euo pipefail
+            mkdir -p /tmp/rdmetal-mesa
+            cd /tmp/rdmetal-mesa
+            curl -fL --retry 3 https://archive.mesa3d.org/mesa-24.0.9.tar.xz -o mesa.tar.xz
+            printf '%s  %s\n' '51aa686ca4060e38711a9e8f60c8f1efaa516baf411946ed7f2c265cd582ca4c' mesa.tar.xz | sha256sum -c -
+            tar -xf mesa.tar.xz
+            cd mesa-24.0.9
+            for p in "$GITHUB_WORKSPACE"/patches/000{1,2,3,4}-*.patch; do patch -Np1 -i "$p"; done
+            cp -r "$GITHUB_WORKSPACE/src/gallium/drivers/rdmetal" src/gallium/drivers/rdmetal
+            cp "$GITHUB_WORKSPACE/src/egl/wayland/rd-owned-buffer-v1.xml" src/egl/wayland/
+            cp "$GITHUB_WORKSPACE/src/egl/wayland/rdmetal-image-export.h" src/egl/wayland/
+            meson setup build --prefix=/usr -Dplatforms=wayland -Dgallium-drivers=swrast \
+              -Dvulkan-drivers= -Dgbm=enabled -Degl=enabled -Dgles1=disabled \
+              -Dgles2=enabled -Dshared-glapi=enabled -Dglx=disabled \
+              -Dllvm=disabled -Dosmesa=false -Dgallium-nine=false \
+              -Dgallium-opencl=disabled -Dgallium-va=disabled \
+              -Dgallium-vdpau=disabled -Dgallium-xa=disabled \
+              -Dlmsensors=disabled -Dlibunwind=disabled -Dvalgrind=disabled \
+              -Dbuild-tests=false -Drdmetal-image-candidate=true
+            meson compile -C build
+            mkdir -p "$GITHUB_WORKSPACE/out"
+            cp build/src/gallium/targets/dri/rdmetal_dri.so "$GITHUB_WORKSPACE/out/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rdmetal-dri-experiment-aarch64
+          path: out/rdmetal_dri.so
+          if-no-files-found: error
