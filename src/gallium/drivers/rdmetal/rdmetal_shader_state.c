@@ -140,7 +140,10 @@ rdmetal_emit_synthetic(enum pipe_shader_type stage, bool textured)
  * the adapter rejects the packet and the whole context is marked failed. */
 static bool rdmetal_nir_supported_resources(const nir_shader *nir, bool fragment)
 {
-   if (nir->info.num_ubos || nir->info.num_ssbos || nir->info.num_images)
+   /* Allow exactly one uniform buffer: Qt's qt_Matrix MVP (a single mat4, 64
+    * bytes). The host binds it as the vertex-stage constant buffer so the app's
+    * own vertex shader transforms position on the GPU. */
+   if (nir->info.num_ubos > 1 || nir->info.num_ssbos || nir->info.num_images)
       return false;
    /* The Qt fragment may be a solid color (no texture) or sample one glyph/
     * atlas image; the vertex stage never samples. */
