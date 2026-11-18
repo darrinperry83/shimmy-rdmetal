@@ -1200,7 +1200,17 @@ static void rdmetal_set_sampler_views(struct pipe_context *p,
             &(uint64_t){0},&(uint64_t){0});
       const bool direct_sample = rdmetal_direct_resource_owns(view->texture);
       if(view->context!=p||view->target!=PIPE_TEXTURE_2D||
-         !(metal_sample||direct_sample)){RDMETAL_FAIL(ctx);return;}
+         !(metal_sample||direct_sample)){
+         if(getenv("RDMETAL_TRACE_TEXTURE"))
+            fprintf(stderr,"RDMETAL_REJECT_SAMPLER_VIEW fmt=%u basefmt=%u target=%u base_target=%u size=%ux%u bind=0x%x context=%p expected=%p metal=%d direct=%d\n",
+                    view->format,view->texture?view->texture->format:0,
+                    view->target,view->texture?view->texture->target:0,
+                    view->texture?view->texture->width0:0,
+                    view->texture?view->texture->height0:0,
+                    view->texture?view->texture->bind:0,
+                    (void *)view->context,(void *)p,metal_sample,direct_sample);
+         RDMETAL_FAIL(ctx);return;
+      }
    }
    if(take_ownership){
       pipe_sampler_view_reference(&ctx->fragment_view,NULL);
