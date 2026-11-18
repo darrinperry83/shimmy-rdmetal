@@ -135,6 +135,11 @@ void *rdmetal_shader_create(enum pipe_shader_type stage,
    if (!state || state->type != PIPE_SHADER_IR_NIR || !state->ir.nir)
       return NULL;
    nir_shader *nir = state->ir.nir;
+   if (getenv("RDMETAL_TRACE_SHADER")) {
+      fprintf(stderr, "RDMETAL_APP_SHADER stage=%d textures=%u\n",
+              (int)stage, (unsigned)nir->info.num_textures);
+      nir_print_shader(nir, stderr);
+   }
    if(getenv("RDMETAL_TRACE_TEXTURE"))
       fprintf(stderr,"RDMETAL_SHADER_CREATE stage=%d num_textures=%u\n",
               (int)stage,(unsigned)nir->info.num_textures);
