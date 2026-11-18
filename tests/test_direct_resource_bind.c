@@ -73,6 +73,20 @@ int main(void)
    rdmetal_direct_resource_release_pending_screen(&screen);
    assert(releases == before + 1);
    assert(!rdmetal_direct_resource_owns(res));
+   struct pipe_screen other_screen = {0};
+   spec.bind = PIPE_BIND_SAMPLER_VIEW;
+   struct pipe_resource *foreign =
+      rdmetal_direct_resource_adopt(&other_screen, &spec, &ops, 17);
+   assert(foreign && rdmetal_direct_resource_owns(foreign));
+   assert(rdmetal_direct_resource_handle(foreign) == 17);
+   assert(!rdmetal_direct_resource_find(&screen, 17));
+   struct pipe_resource *found = rdmetal_direct_resource_find(&other_screen, 17);
+   assert(found == foreign);
+   assert(!pipe_reference(&found->reference, NULL));
+   assert(!rdmetal_direct_resource_adopt(&other_screen, &spec, &ops, 0));
+   spec.bind = PIPE_BIND_RENDER_TARGET;
+   assert(!rdmetal_direct_resource_adopt(&other_screen, &spec, &ops, 17));
+   rdmetal_direct_resource_destroy(foreign);
    puts("direct RGBA8 accepts sample, render, and combined binds");
    return 0;
 }

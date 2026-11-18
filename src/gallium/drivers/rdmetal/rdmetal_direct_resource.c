@@ -79,6 +79,40 @@ rdmetal_direct_resource_create(struct pipe_screen *screen,
    return &res->base;
 }
 
+struct pipe_resource *
+rdmetal_direct_resource_adopt(struct pipe_screen *screen,
+                              const struct pipe_resource *templ,
+                              const struct rdmetal_direct_ops *ops,
+                              long handle)
+{
+   if (!screen || !templ || !ops || !ops->clear || !ops->wait ||
+       !ops->release || handle <= 0 || templ->target != PIPE_TEXTURE_2D ||
+       !rdmetal_direct_format_supported(templ->format) ||
+       !(templ->bind & PIPE_BIND_SAMPLER_VIEW) ||
+       (templ->bind & PIPE_BIND_RENDER_TARGET) ||
+       templ->last_level || templ->depth0 != 1 || templ->array_size != 1 ||
+       templ->nr_samples || !templ->width0 || !templ->height0 ||
+       templ->width0 > 4096 || templ->height0 > 4096)
+      return NULL;
+   struct rdmetal_direct_resource *res = calloc(1, sizeof(*res));
+   if (!res) return NULL;
+   res->base = *templ;
+   pipe_reference_init(&res->base.reference, 1);
+   res->base.screen = screen;
+   res->broker_handle = handle;
+   res->clear = ops->clear;
+   res->wait = ops->wait;
+   res->release = ops->release;
+   /* A client's imported buffer can be sampled, never re-exported or used as
+    * a compositor render target. The host guest slot enforces the same rule. */
+   res->exported = true;
+   pthread_mutex_lock(&rdmetal_resource_lock);
+   res->next = rdmetal_resources;
+   rdmetal_resources = res;
+   pthread_mutex_unlock(&rdmetal_resource_lock);
+   return &res->base;
+}
+
 void
 rdmetal_direct_resource_destroy(struct pipe_resource *resource)
 {
@@ -171,10 +205,10 @@ rdmetal_direct_resource_hold_for_import(struct pipe_resource *resource)
 struct pipe_resource *
 rdmetal_direct_resource_find(struct pipe_screen *screen, long handle)
 {
-   (void)screen;
    pthread_mutex_lock(&rdmetal_resource_lock);
    struct rdmetal_direct_resource *node = rdmetal_resources;
-   while (node && node->broker_handle != handle)
+   while (node && (node->broker_handle != handle ||
+                   node->base.screen != screen))
       node = node->next;
    struct pipe_resource *found = node ? &node->base : NULL;
    if (found) {

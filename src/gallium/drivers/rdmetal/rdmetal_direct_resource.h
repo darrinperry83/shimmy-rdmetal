@@ -30,6 +30,11 @@ rdmetal_direct_format_supported(enum pipe_format format)
 struct pipe_resource *rdmetal_direct_resource_create(
    struct pipe_screen *screen, const struct pipe_resource *templ,
    const struct rdmetal_direct_ops *ops);
+/* Adopt a broker-validated foreign IOSurface lease returned by shim op 12.
+ * Ownership of handle transfers to the returned resource on success. */
+struct pipe_resource *rdmetal_direct_resource_adopt(
+   struct pipe_screen *screen, const struct pipe_resource *templ,
+   const struct rdmetal_direct_ops *ops, long handle);
 void rdmetal_direct_resource_destroy(struct pipe_resource *resource);
 bool rdmetal_direct_resource_owns(const struct pipe_resource *resource);
 long rdmetal_direct_resource_handle(const struct pipe_resource *resource);

@@ -24,6 +24,7 @@
 static atomic_uint rdmetal_clears;
 static atomic_uint rdmetal_resources;
 static bool rdmetal_direct_mode;
+static const struct rdmetal_direct_ops rdmetal_broker_ops;
 /* EGL probes and destroys multiple screens while negotiating a context. A
  * process-global fallback pointer lets an old screen's destroy tear down a
  * newer screen's depth/stencil context, leaving complete FBO attachments with
@@ -219,7 +220,8 @@ rdmetal_resource_from_handle(struct pipe_screen *screen,
        wh->type == WINSYS_HANDLE_TYPE_FD &&
        rdmetal_direct_format_supported(wh->format)) {
       int fd = (int)wh->handle;
-      long handle = syscall(0x2002L, 12L, (long)fd, 0L, 0L, 0L, 0L);
+      long handle = syscall(0x2002L, 12L, (long)fd,
+                            (long)templ->width0, (long)templ->height0, 0L, 0L);
       if (handle > 0) {
          struct pipe_resource *existing =
             rdmetal_direct_resource_find(screen, handle);
@@ -229,6 +231,18 @@ rdmetal_resource_from_handle(struct pipe_screen *screen,
                        fd, handle);
             return existing;
          }
+         /* The handle may name a broker lease imported from a different
+          * guest process. Its IOSurface and geometry were checked by Shimmy;
+          * adopt that exact lease rather than allocating a replacement. */
+         struct pipe_resource *foreign = rdmetal_direct_resource_adopt(
+            screen, templ, &rdmetal_broker_ops, handle);
+         if (foreign) {
+            if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
+               fprintf(stderr, "RDMESA_DMABUF_IMPORT_FOREIGN fd=%d handle=%ld\n",
+                       fd, handle);
+            return foreign;
+         }
+         syscall(0x2002L, 4L, handle, 0L, 0L, 0L, 0L);
       }
       if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
          fprintf(stderr, "RDMESA_DMABUF_IMPORT_UNRESOLVED fd=%d handle=%ld\n",
