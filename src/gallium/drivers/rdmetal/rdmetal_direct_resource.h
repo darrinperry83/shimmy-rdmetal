@@ -33,6 +33,9 @@ struct pipe_resource *rdmetal_direct_resource_create(
 void rdmetal_direct_resource_destroy(struct pipe_resource *resource);
 bool rdmetal_direct_resource_owns(const struct pipe_resource *resource);
 long rdmetal_direct_resource_handle(const struct pipe_resource *resource);
+/* Keep the exported image alive until an authenticated FD import consumes it. */
+bool rdmetal_direct_resource_hold_for_import(struct pipe_resource *resource);
+void rdmetal_direct_resource_release_pending_screen(struct pipe_screen *screen);
 /* Look up an existing direct resource by its opaque broker handle. Returns a
  * new +1 reference (the caller owns it) or NULL when no resource matches. */
 struct pipe_resource *rdmetal_direct_resource_find(struct pipe_screen *screen,
@@ -45,6 +48,9 @@ int rdmetal_direct_resource_wait(struct pipe_resource *resource, long fence);
 /* Upload a complete level-0 image into the existing broker-owned IOSurface. */
 int rdmetal_direct_resource_upload(struct pipe_resource *resource,
                                    const void *pixels, size_t bytes);
+int rdmetal_direct_resource_upload_region(struct pipe_resource *resource,
+                                   const void *pixels,uint32_t x,uint32_t y,
+                                   uint32_t width,uint32_t height,uint32_t stride);
 int rdmetal_direct_resource_export(struct pipe_resource *resource,
                                    struct rdmetal_image_export_v1 *out);
 

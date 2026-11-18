@@ -2,6 +2,7 @@
  * renderable, but the driver also has to accept a sampler-only template. */
 #include "rdmetal_direct_resource.h"
 #include "pipe/p_state.h"
+#include "util/u_inlines.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -18,7 +19,9 @@ static int waitf(long handle, long fence)
 {
    return handle == 17 && fence == 1 ? 0 : -1;
 }
-static int release(long handle) { return handle == 17 ? 0 : -1; }
+static unsigned releases;
+static int release(long handle)
+{ if (handle != 17) return -1; releases++; return 0; }
 
 /* pipe_resource_reference() includes this diagnostic callback. The test only
  * links rdmetal_direct_resource.c, without the rest of Mesa's util library. */
@@ -52,6 +55,24 @@ int main(void)
       assert(rdmetal_direct_resource_handle(res) == 17);
       rdmetal_direct_resource_destroy(res);
    }
+   spec.bind = PIPE_BIND_RENDER_TARGET;
+   struct pipe_resource *res =
+      rdmetal_direct_resource_create(&screen, &spec, &ops);
+   assert(res && rdmetal_direct_resource_hold_for_import(res));
+   assert(!rdmetal_direct_resource_hold_for_import(res));
+   assert(!pipe_reference(&res->reference, NULL)); /* exporter drops its ref */
+   struct pipe_resource *imported = rdmetal_direct_resource_find(&screen, 17);
+   assert(imported == res);
+   assert(pipe_reference(&imported->reference, NULL));
+   rdmetal_direct_resource_destroy(imported);
+
+   res = rdmetal_direct_resource_create(&screen, &spec, &ops);
+   assert(res && rdmetal_direct_resource_hold_for_import(res));
+   assert(!pipe_reference(&res->reference, NULL));
+   unsigned before = releases;
+   rdmetal_direct_resource_release_pending_screen(&screen);
+   assert(releases == before + 1);
+   assert(!rdmetal_direct_resource_owns(res));
    puts("direct RGBA8 accepts sample, render, and combined binds");
    return 0;
 }

@@ -33,6 +33,23 @@ static pthread_mutex_t rdmetal_softpipe_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define RDMETAL_SP_LOCK()    pthread_mutex_lock(&rdmetal_softpipe_mutex)
 #define RDMETAL_SP_UNLOCK()  pthread_mutex_unlock(&rdmetal_softpipe_mutex)
 
+/* The direct context does not implement GPU queries. Mesa may still probe a
+ * query entry point even when the screen reports no query capability. Return
+ * unsupported explicitly instead of leaving a NULL function pointer. */
+static struct pipe_query *rdmetal_create_query(struct pipe_context *pipe,
+                                                unsigned type,unsigned index)
+{ (void)pipe;(void)type;(void)index;return NULL; }
+static void rdmetal_destroy_query(struct pipe_context *pipe,struct pipe_query *q)
+{ (void)pipe;(void)q; }
+static bool rdmetal_begin_query(struct pipe_context *pipe,struct pipe_query *q)
+{ (void)pipe;(void)q;return false; }
+static bool rdmetal_end_query(struct pipe_context *pipe,struct pipe_query *q)
+{ (void)pipe;(void)q;return false; }
+static bool rdmetal_get_query_result(struct pipe_context *pipe,
+                                    struct pipe_query *q,bool wait,
+                                    union pipe_query_result *result)
+{ (void)pipe;(void)q;(void)wait;(void)result;return false; }
+
 struct rdmetal_clear_context {
    struct pipe_context base;
    struct pipe_surface *color;
@@ -43,7 +60,7 @@ struct rdmetal_clear_context {
    unsigned draw_fence_count;
    bool failed;
    void *vertex_shader, *fragment_shader;
-   struct pipe_vertex_buffer vertex_buffer;
+   struct pipe_vertex_buffer vertex_buffers[2];
    rdmetal_draw_submit_fn draw_submit;
    void *draw_opaque;
    rdmetal_draw_poll_fn draw_poll;
@@ -66,6 +83,7 @@ struct rdmetal_clear_context {
    struct pipe_context *softpipe;
 };
 static struct rdmetal_clear_context *self(struct pipe_context *context);
+#define RDMETAL_FAIL(ctx) do { if (!(ctx)->failed && getenv("RDMETAL_TRACE_DRAW")) fprintf(stderr,"RDMETAL_FIRST_FAILURE line=%d function=%s\n",__LINE__,__func__); (ctx)->failed = true; } while (0)
 
 /* A state object carried by both halves of the hybrid context. The bounded
  * Metal path keeps `metal` (a copy or a compiled rdmetal object); the softpipe
@@ -85,7 +103,7 @@ static long rdmetal_draw_guest_submit(void *opaque,const void *packet,size_t byt
    (void)opaque;
    const struct rdmetal_draw_header *header=packet;
    if(!packet||bytes<sizeof(*header)||
-      bytes>sizeof(struct rdmetal_draw_header_v3)+2u*RDMETAL_DRAW_MAX_SHADER_WORDS*4u+
+      bytes>sizeof(struct rdmetal_draw_header_v4)+2u*RDMETAL_DRAW_MAX_SHADER_WORDS*4u+
             RDMETAL_DRAW_MAX_VERTEX_BYTES+RDMETAL_DRAW_MAX_INDEX_BYTES+
             RDMETAL_DRAW_MAX_UNIFORM_BYTES||
       header->total_bytes!=bytes||!header->target_handle)return -EINVAL;
@@ -112,9 +130,11 @@ static long rdmetal_draw_mock_submit(void *opaque,const void *packet,size_t byte
    size_t extra = 0;
    if (h->version == RDMETAL_DRAW_VERSION_TEXTURE)
       prefix = sizeof(struct rdmetal_draw_header_v2);
-   else if (h->version == RDMETAL_DRAW_VERSION_V3) {
+   else if (h->version == RDMETAL_DRAW_VERSION_V3 ||
+            h->version == RDMETAL_DRAW_VERSION_V4) {
       const struct rdmetal_draw_header_v3 *v3 = packet;
-      prefix = sizeof(*v3);
+      prefix = h->version == RDMETAL_DRAW_VERSION_V4 ?
+         sizeof(struct rdmetal_draw_header_v4) : sizeof(*v3);
       extra = (size_t)v3->index_count *
          (v3->index_type==RDMETAL_DRAW_INDEX_U16 ? 2u :
           v3->index_type==RDMETAL_DRAW_INDEX_U32 ? 4u : 0u) +
@@ -296,15 +316,12 @@ static void *rdmetal_create_vertex_elements(struct pipe_context *p,
    bool metal_ok = elements && count>=1 && count<=2 &&
       rdmetal_plain_position(&elements[0]);
    if (metal_ok && count==2) {
-      /* A second attribute is either a real float2 texcoord (forwarded as the
-       * atlas UV) or a float3 normal (es2gears; ignored). It must share the
-       * interleaved vertex buffer 0. Separate per-attribute buffers are not
-       * supported in this bounded slice. */
-      metal_ok = !elements[1].vertex_buffer_index && !elements[1].dual_slot &&
+   /* A second attribute can come from an independent CPU-backed vertex
+    * buffer. Both inputs are repacked into the canonical Metal interleave. */
+      metal_ok = elements[1].vertex_buffer_index <= 1 && !elements[1].dual_slot &&
          !elements[1].instance_divisor &&
          (elements[1].src_format==PIPE_FORMAT_R32G32_FLOAT ||
-          elements[1].src_format==PIPE_FORMAT_R32G32B32_FLOAT) &&
-         elements[1].src_stride==elements[0].src_stride;
+          elements[1].src_format==PIPE_FORMAT_R32G32B32_FLOAT);
    }
    struct rdmetal_vertex_elements *state = NULL;
    if (metal_ok) {
@@ -362,31 +379,27 @@ static void rdmetal_set_vertex_buffers(struct pipe_context *p,
                                        false, mirror_valid ? &mirror : NULL);
       RDMETAL_SP_UNLOCK();
    }
-   if (!ctx->vertex_buffer.is_user_buffer)
-      pipe_resource_reference(&ctx->vertex_buffer.buffer.resource,NULL);
-   memset(&ctx->vertex_buffer,0,sizeof(ctx->vertex_buffer));
-   if(count==0)return;
-   /* Gallium may unbind a slot by supplying one empty vertex buffer. */
-   if(count==1 && buffers && !buffers[0].is_user_buffer &&
-      !buffers[0].buffer.resource)return;
-   /* trailing is the number of higher vertex slots to unbind, not an
-    * additional bound buffer. The direct path consumes slot zero only. */
-   if(count<1||!buffers||
-      (buffers[0].is_user_buffer ? !buffers[0].buffer.user :
-       !rdmetal_cpu_buffer_owns(buffers[0].buffer.resource))){
-      if(getenv("RDMETAL_TRACE_DRAW"))
-         fprintf(stderr,"RDMETAL_REJECT_VB count=%u trailing=%u user=%d resource=%p owned=%d\n",
-                 count,trailing,buffers?buffers[0].is_user_buffer:0,
-                 buffers&&!buffers[0].is_user_buffer?(void*)buffers[0].buffer.resource:NULL,
-                 buffers&&!buffers[0].is_user_buffer&&buffers[0].buffer.resource?
-                    rdmetal_cpu_buffer_owns(buffers[0].buffer.resource):0);
-      ctx->failed=true;return;
+   for (unsigned i = 0; i < 2; ++i) {
+      if (!ctx->vertex_buffers[i].is_user_buffer)
+         pipe_resource_reference(&ctx->vertex_buffers[i].buffer.resource,NULL);
    }
-   ctx->vertex_buffer=buffers[0];
-   if (!buffers[0].is_user_buffer && !take_ownership) {
-      ctx->vertex_buffer.buffer.resource=NULL;
-      pipe_resource_reference(&ctx->vertex_buffer.buffer.resource,
-                              buffers[0].buffer.resource);
+   memset(ctx->vertex_buffers,0,sizeof(ctx->vertex_buffers));
+   if (count > 2 || (count && !buffers)) { RDMETAL_FAIL(ctx); return; }
+   for (unsigned i = 0; i < count; ++i) {
+      const struct pipe_vertex_buffer *src=&buffers[i];
+      if (src->is_user_buffer ? !src->buffer.user :
+          (src->buffer.resource && !rdmetal_cpu_buffer_owns(src->buffer.resource))) {
+         if (getenv("RDMETAL_TRACE_DRAW"))
+            fprintf(stderr,"RDMETAL_REJECT_VB slot=%u resource=%p\n",
+                    i,src->is_user_buffer?NULL:(void*)src->buffer.resource);
+         RDMETAL_FAIL(ctx);return;
+      }
+      ctx->vertex_buffers[i]=*src;
+      if (!src->is_user_buffer && src->buffer.resource && !take_ownership) {
+         ctx->vertex_buffers[i].buffer.resource=NULL;
+         pipe_resource_reference(&ctx->vertex_buffers[i].buffer.resource,
+                                 src->buffer.resource);
+      }
    }
 }
 
@@ -398,8 +411,10 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    struct rdmetal_clear_context *ctx=self(p);
    if (ctx->framebuffer_route != RDMETAL_FB_DIRECT) {
       bool safe = ctx->framebuffer_route == RDMETAL_FB_SOFTPIPE && ctx->softpipe;
-      if (!ctx->vertex_buffer.is_user_buffer && ctx->vertex_buffer.buffer.resource &&
-          !rdmetal_cpu_buffer_owns(ctx->vertex_buffer.buffer.resource)) safe = false;
+      for (unsigned i=0;i<2;i++)
+         if (!ctx->vertex_buffers[i].is_user_buffer &&
+             ctx->vertex_buffers[i].buffer.resource &&
+             !rdmetal_cpu_buffer_owns(ctx->vertex_buffers[i].buffer.resource)) safe = false;
       if (ctx->vs_const.buffer && rdmetal_cpu_buffer_owns(ctx->vs_const.buffer)) safe = false;
       if (info && info->index_size && !info->has_user_indices && info->index.resource &&
           rdmetal_cpu_buffer_owns(info->index.resource)) safe = false;
@@ -412,20 +427,18 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
       }
       return;
    }
-   /* The host draw packet does not yet carry a scissor rectangle. The
-    * state tracker always supplies the callback, even when the rectangle
-    * spans the whole target. Reject restrictive clipping rather than drawing
-    * outside the app's requested bounds. */
-   if (ctx->have_scissor &&
-       (ctx->scissor.minx || ctx->scissor.miny ||
-        ctx->scissor.maxx < ctx->color->width ||
-        ctx->scissor.maxy < ctx->color->height)) {
-      if (getenv("RDMETAL_TRACE_DRAW"))
-         fprintf(stderr,"RDMETAL_REJECT_SCISSOR %u,%u-%u,%u target=%ux%u\n",
-                 ctx->scissor.minx,ctx->scissor.miny,ctx->scissor.maxx,ctx->scissor.maxy,
-                 ctx->color->width,ctx->color->height);
-      ctx->failed = true;
-      return;
+   /* Gallium's scissor is in top-left framebuffer coordinates, as is Metal's.
+    * Clip to the target bounds before sending the rectangle across the guest
+    * boundary. An empty intersection is a legal no-op draw. */
+   uint32_t sx = 0, sy = 0, ex = ctx->color->width, ey = ctx->color->height;
+   const struct pipe_rasterizer_state *rast = ctx->rasterizer;
+   if (rast && rast->scissor) {
+      if (!ctx->have_scissor) { RDMETAL_FAIL(ctx); return; }
+      sx = MIN2((uint32_t)ctx->scissor.minx, ex);
+      sy = MIN2((uint32_t)ctx->scissor.miny, ey);
+      ex = MIN2((uint32_t)ctx->scissor.maxx, ex);
+      ey = MIN2((uint32_t)ctx->scissor.maxy, ey);
+      if (sx >= ex || sy >= ey) return;
    }
    /* Clear and draw may use different host command queues. Do not race a
     * prior clear against the first draw on the same IOSurface. */
@@ -445,6 +458,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
          ((const struct rdmetal_hybrid_state *)ctx->vertex_elements)->metal : NULL;
    const bool triangles = info && info->mode==MESA_PRIM_TRIANGLES;
    const bool strip = info && info->mode==MESA_PRIM_TRIANGLE_STRIP;
+   const bool fan = info && info->mode==MESA_PRIM_TRIANGLE_FAN;
    const bool indexed = info && info->index_size!=0;
    if(getenv("RDMETAL_TRACE_DRAW"))
       fprintf(stderr,"RDMETAL_DRAW_VBO failed=%d ve=%p mode=%d count=%u useridx=%d idxsz=%u ve_fmt=%d ve_stride=%u ve_count=%u\n",
@@ -454,45 +468,63 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
               ve?ve->count:0);
    if(ctx->failed||!ctx->draw_submit||!ctx->color||
       !ve||!vs||!fs||!info||!draws||indirect||
-      drawid_offset||num_draws!=1||(!triangles&&!strip)||
+      drawid_offset||num_draws!=1||(!triangles&&!strip&&!fan)||
       info->primitive_restart||info->view_mask||
       info->start_instance||info->instance_count!=1||
-      draws[0].start||(indexed&&draws[0].index_bias)||
       vs_count>RDMETAL_DRAW_MAX_SHADER_WORDS||
-      fs_count>RDMETAL_DRAW_MAX_SHADER_WORDS){ctx->failed=true;return;}
+      fs_count>RDMETAL_DRAW_MAX_SHADER_WORDS){
+      if(!ctx->failed && getenv("RDMETAL_TRACE_DRAW")) fprintf(stderr,
+         "RDMETAL_DRAW_REJECT submit=%d color=%d ve=%d vs=%d fs=%d info=%d draws=%d indirect=%d drawid=%u n=%u mode=%d count=%u tri=%d strip=%d restart=%d viewmask=%u firstinst=%u instances=%u start=%u bias=%d vswords=%zu fswords=%zu\n",
+         ctx->draw_submit!=NULL,ctx->color!=NULL,ve!=NULL,vs!=NULL,fs!=NULL,
+         info!=NULL,draws!=NULL,indirect!=NULL,drawid_offset,num_draws,
+         info?(int)info->mode:-1,draws?draws[0].count:0,
+         triangles,strip,info?info->primitive_restart:0,info?info->view_mask:0,
+         info?info->start_instance:0,info?info->instance_count:0,
+         draws?draws[0].start:0,draws?draws[0].index_bias:0,
+         vs_count,fs_count);
+      RDMETAL_FAIL(ctx);return;}
 
-   /* Bounded index support: u16/u32 triangle lists only (no indexed strips,
-    * no primitive restart, no index bias). This is exactly the atlas-quad
-    * glDrawElements(GL_TRIANGLES, ...) shape Hyprland/KDE use. */
+   /* Bounded u16/u32 triangle lists. Gallium's start selects the first index
+    * in the index buffer; index_bias shifts the vertex fetched by that index. */
    const unsigned index_size = indexed ? info->index_size : 0u;
    uint32_t index_type = RDMETAL_DRAW_INDEX_NONE;
    unsigned index_count = 0;
    const uint8_t *index_data = NULL;
    uint32_t max_index = 0;
+   uint32_t min_index = UINT32_MAX;
    if (indexed) {
-      if (index_size != 2 && index_size != 4) { ctx->failed=true; return; }
-      if (strip) { ctx->failed=true; return; }
+      if (index_size != 2 && index_size != 4) { RDMETAL_FAIL(ctx); return; }
+      if (strip || fan) { RDMETAL_FAIL(ctx); return; }
       index_type = index_size==2 ? RDMETAL_DRAW_INDEX_U16 : RDMETAL_DRAW_INDEX_U32;
       index_count = draws[0].count;
-      if (!index_count || (index_count % 3)) { ctx->failed=true; return; }
+      if (!index_count || (index_count % 3)) { RDMETAL_FAIL(ctx); return; }
       size_t index_bytes = (size_t)index_count * index_size;
-      if (index_bytes > RDMETAL_DRAW_MAX_INDEX_BYTES) { ctx->failed=true; return; }
-      if (info->has_user_indices) {
-         index_data = info->index.user;
-      } else {
-         index_data = rdmetal_cpu_buffer_data(info->index.resource, 0, index_bytes);
+      size_t index_offset = (size_t)draws[0].start * index_size;
+      if (index_bytes > RDMETAL_DRAW_MAX_INDEX_BYTES ||
+          index_offset > RDMETAL_DRAW_MAX_INDEX_BYTES - index_bytes) {
+         RDMETAL_FAIL(ctx); return;
       }
-      if (!index_data) { ctx->failed=true; return; }
-      if (info->index_bounds_valid) {
-         max_index = info->max_index;
-      } else if (index_size == 2) {
-         const uint16_t *ix = (const uint16_t *)index_data;
-         for (unsigned i=0;i<index_count;i++)
-            if (ix[i] > max_index) max_index = ix[i];
+      if (info->has_user_indices) {
+         if (!info->index.user) { RDMETAL_FAIL(ctx); return; }
+         index_data = (const uint8_t *)info->index.user + index_offset;
       } else {
-         const uint32_t *ix = (const uint32_t *)index_data;
-         for (unsigned i=0;i<index_count;i++)
-            if (ix[i] > max_index) max_index = ix[i];
+         index_data = rdmetal_cpu_buffer_data(info->index.resource,
+                                               index_offset, index_bytes);
+      }
+      if (!index_data) { RDMETAL_FAIL(ctx); return; }
+      for (unsigned i=0;i<index_count;i++) {
+         uint32_t value;
+         if (index_size == 2) {
+            uint16_t v; memcpy(&v,index_data+(size_t)i*2,2); value=v;
+         } else {
+            memcpy(&value,index_data+(size_t)i*4,4);
+         }
+         if (value > max_index) max_index=value;
+         if (value < min_index) min_index=value;
+      }
+      if ((int64_t)min_index + draws[0].index_bias < 0 ||
+          (int64_t)max_index + draws[0].index_bias > 65535) {
+         RDMETAL_FAIL(ctx); return;
       }
    }
 
@@ -506,25 +538,46 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    const unsigned pos_floats =
       ve->element[0].src_format==PIPE_FORMAT_R32G32B32_FLOAT ? 3u : 2u;
    const unsigned src_stride = ve->element[0].src_stride;
+   const unsigned uv_stride = has_uv ? ve->element[1].src_stride : 0;
+   const unsigned uv_slot = has_uv ? ve->element[1].vertex_buffer_index : 0;
    const unsigned pos_offset = ve->element[0].src_offset;
    const unsigned uv_offset = has_uv ? ve->element[1].src_offset : 0;
-   if (pos_offset + pos_floats*4 > src_stride) { ctx->failed=true; return; }
-   if (has_uv && uv_offset + 8 > src_stride) { ctx->failed=true; return; }
+   if (pos_offset + pos_floats*4 > src_stride) { RDMETAL_FAIL(ctx); return; }
+   if (has_uv && uv_offset + 8 > uv_stride) { RDMETAL_FAIL(ctx); return; }
 
    const unsigned source_count = indexed ? (max_index + 1u) : draws[0].count;
-   if (!source_count || source_count > 65535) { ctx->failed=true; return; }
-   if (triangles && (draws[0].count % 3)) { ctx->failed=true; return; }
-   if (strip && source_count < 3) { ctx->failed=true; return; }
+   if (!source_count || source_count > 65535) { RDMETAL_FAIL(ctx); return; }
+   int64_t source_max = indexed ? (int64_t)max_index + draws[0].index_bias :
+                         (int64_t)draws[0].start + draws[0].count - 1;
+   if (source_max < 0 || source_max > 65535) { RDMETAL_FAIL(ctx); return; }
+   if (triangles && (draws[0].count % 3)) { RDMETAL_FAIL(ctx); return; }
+   if ((strip || fan) && source_count < 3) { RDMETAL_FAIL(ctx); return; }
    const unsigned triangle_count = indexed ? index_count :
-                                  strip ? (source_count - 2) * 3 : source_count;
-   if (triangle_count > 65535) { ctx->failed=true; return; }
+                                  (strip || fan) ? (source_count - 2) * 3 : source_count;
+   if (triangle_count > 65535) { RDMETAL_FAIL(ctx); return; }
 
-   size_t source_bytes = (size_t)source_count * src_stride;
-   const uint8_t *src_vertices = ctx->vertex_buffer.is_user_buffer ?
-      (const uint8_t *)ctx->vertex_buffer.buffer.user :
-      rdmetal_cpu_buffer_data(ctx->vertex_buffer.buffer.resource,
-                              ctx->vertex_buffer.buffer_offset,source_bytes);
-   if (!src_vertices) { ctx->failed=true; return; }
+   size_t source_bytes = (size_t)source_max * src_stride +
+                         pos_offset + pos_floats * 4u;
+   const struct pipe_vertex_buffer *pos_buffer=&ctx->vertex_buffers[0];
+   const uint8_t *src_vertices = pos_buffer->is_user_buffer ?
+      (const uint8_t *)pos_buffer->buffer.user :
+      rdmetal_cpu_buffer_data(pos_buffer->buffer.resource,
+                              pos_buffer->buffer_offset,source_bytes);
+   if (!src_vertices) {
+      if (getenv("RDMETAL_TRACE_DRAW")) fprintf(stderr,"RDMETAL_FAIL_POS slot=0 resource=%p user=%p offset=%u bytes=%zu\n",(void*)pos_buffer->buffer.resource,pos_buffer->buffer.user,pos_buffer->buffer_offset,source_bytes);
+      RDMETAL_FAIL(ctx); return; }
+   const uint8_t *src_uv_vertices = NULL;
+   if (has_uv) {
+      const struct pipe_vertex_buffer *uv_buffer=&ctx->vertex_buffers[uv_slot];
+      size_t uv_bytes=(size_t)source_max * uv_stride + uv_offset + 8u;
+      src_uv_vertices=uv_buffer->is_user_buffer ?
+         (const uint8_t *)uv_buffer->buffer.user :
+         rdmetal_cpu_buffer_data(uv_buffer->buffer.resource,
+                                 uv_buffer->buffer_offset,uv_bytes);
+      if (!src_uv_vertices) {
+         if (getenv("RDMETAL_TRACE_DRAW")) fprintf(stderr,"RDMETAL_FAIL_UV slot=%u resource=%p user=%p offset=%u bytes=%zu\n",uv_slot,(void*)uv_buffer->buffer.resource,uv_buffer->buffer.user,uv_buffer->buffer_offset,uv_bytes);
+         RDMETAL_FAIL(ctx); return; }
+   }
    if(getenv("RDMETAL_TRACE_DRAW")){
       const float *f=(const float *)src_vertices;
       for(unsigned k=0;k<18&&k*sizeof(float)<source_bytes;k++)
@@ -535,9 +588,9 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    const unsigned out_stride = 12u + 8u;
    const unsigned out_count = indexed ? source_count : triangle_count;
    size_t vertex_bytes = (size_t)out_count * out_stride;
-   if (vertex_bytes > RDMETAL_DRAW_MAX_VERTEX_BYTES) { ctx->failed=true; return; }
+   if (vertex_bytes > RDMETAL_DRAW_MAX_VERTEX_BYTES) { RDMETAL_FAIL(ctx); return; }
    uint8_t *out_vertices = malloc(vertex_bytes ? vertex_bytes : 1);
-   if (!out_vertices) { ctx->failed=true; return; }
+   if (!out_vertices) { RDMETAL_FAIL(ctx); return; }
 
    /* Forward the app's single mat4 MVP (first 64 bytes of the vertex-stage
     * constant buffer) on the CPU; default to the bounded 0.25-scale identity
@@ -566,19 +619,25 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    }
 
    for (unsigned i = 0; i < out_count; i++) {
-      unsigned src_idx;
+      int64_t src_idx;
       if (indexed) {
-         src_idx = i; /* repack every unique vertex 0..max_index */
+         src_idx = (int64_t)i + draws[0].index_bias;
       } else if (strip) {
          unsigned tri = i / 3, corner = i % 3;
          unsigned va = tri, vb = tri + 1, vc = tri + 2;
          if (tri & 1) { unsigned t = va; va = vb; vb = t; }
-         src_idx = corner==0 ? va : corner==1 ? vb : vc;
+         src_idx = (int64_t)draws[0].start +
+                   (corner==0 ? va : corner==1 ? vb : vc);
+      } else if (fan) {
+         unsigned tri = i / 3, corner = i % 3;
+         src_idx = (int64_t)draws[0].start +
+                   (corner==0 ? 0 : corner==1 ? tri+1 : tri+2);
       } else {
-         src_idx = i;
+         src_idx = (int64_t)draws[0].start + i;
       }
-      const float *sp = (const float *)(src_vertices + (size_t)src_idx * src_stride);
       float *dp = (float *)(out_vertices + (size_t)i * out_stride);
+      if (src_idx < 0) { memset(dp,0,out_stride); continue; }
+      const float *sp = (const float *)(src_vertices + (size_t)src_idx * src_stride);
       const float px = sp[pos_offset/4 + 0];
       const float py = sp[pos_offset/4 + 1];
       const float pz = pos_floats==3 ? sp[pos_offset/4 + 2] : 0.0f;
@@ -586,7 +645,7 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
       dp[1] = m[1]*px + m[5]*py + m[9]*pz  + m[13];
       dp[2] = m[2]*px + m[6]*py + m[10]*pz + m[14];
       if (has_uv) {
-         const float *uv = (const float *)(src_vertices + (size_t)src_idx * src_stride + uv_offset);
+         const float *uv = (const float *)(src_uv_vertices + (size_t)src_idx * uv_stride + uv_offset);
          dp[3] = uv[0]; dp[4] = uv[1];
       } else {
          dp[3] = px*0.5f + 0.5f;
@@ -594,20 +653,16 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
       }
    }
 
-   bool textured=ctx->fragment_sampler&&ctx->fragment_view;
+   bool textured=rdmetal_shader_textured(metal_fs,PIPE_SHADER_FRAGMENT);
    if(getenv("RDMETAL_TRACE_DRAW"))
       fprintf(stderr,"RDMETAL_DRAW_TEXTURED sampler=%p view=%p fs_tex=%d has_uv=%d indexed=%d idx_type=%u idx_count=%u max_idx=%u\n",
               (void*)ctx->fragment_sampler,(void*)ctx->fragment_view,
               rdmetal_shader_textured(metal_fs,PIPE_SHADER_FRAGMENT),
               has_uv,indexed,index_type,index_count,max_index);
-   if((ctx->fragment_sampler==NULL)!=(ctx->fragment_view==NULL)){
-      free(out_vertices);ctx->failed=true;return;
-   }
-   /* The bounded synthetic pipeline must agree with the bound sampler on
-    * whether the fragment shader samples a texture, or the draw host rejects
-    * it. */
-   if(rdmetal_shader_textured(metal_fs,PIPE_SHADER_FRAGMENT)!=textured){
-      free(out_vertices);ctx->failed=true;return;
+   /* Sampler bindings can outlive a shader change. Only a shader that actually
+    * samples a texture requires a complete sampler/view pair. */
+   if(textured&&(!ctx->fragment_sampler||!ctx->fragment_view)){
+      free(out_vertices);RDMETAL_FAIL(ctx);return;
    }
    uint64_t texture_handle=0,texture_generation=0;
    if(textured){
@@ -617,29 +672,29 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
           * its opaque broker handle as the texture handle; the host resolves
           * it to the same IOSurface and samples it as a shader-read texture. */
          if(!rdmetal_direct_resource_owns(ctx->fragment_view->texture)){
-            free(out_vertices);ctx->failed=true;return;
+            free(out_vertices);RDMETAL_FAIL(ctx);return;
          }
          long direct_handle =
             rdmetal_direct_resource_handle(ctx->fragment_view->texture);
-         if(direct_handle<=0){free(out_vertices);ctx->failed=true;return;}
+         if(direct_handle<=0){free(out_vertices);RDMETAL_FAIL(ctx);return;}
          texture_handle=(uint64_t)direct_handle;
          texture_generation=1; /* bounded direct render-target lease generation */
       }
    }
    size_t index_bytes = indexed ? (size_t)index_count * index_size : 0;
-   const size_t header_bytes = sizeof(struct rdmetal_draw_header_v3);
+   const size_t header_bytes = sizeof(struct rdmetal_draw_header_v4);
    size_t bytes = header_bytes +
                   (vs_count+fs_count)*sizeof(uint32_t) + vertex_bytes +
                   index_bytes + 0u /* uniform_bytes=0 */;
    if(bytes>UINT32_MAX){
-      free(out_vertices);ctx->failed=true;return;
+      free(out_vertices);RDMETAL_FAIL(ctx);return;
    }
    uint64_t handle=rdmetal_direct_resource_handle(ctx->color->texture);
-   if(!handle){free(out_vertices);ctx->failed=true;return;}
+   if(!handle){free(out_vertices);RDMETAL_FAIL(ctx);return;}
    struct rdmetal_draw_header *wire=calloc(1,bytes);
-   if(!wire){free(out_vertices);ctx->failed=true;return;}
+   if(!wire){free(out_vertices);RDMETAL_FAIL(ctx);return;}
    wire->magic=RDMETAL_DRAW_MAGIC;
-   wire->version=RDMETAL_DRAW_VERSION_V3;
+   wire->version=RDMETAL_DRAW_VERSION_V4;
    wire->total_bytes=(uint32_t)bytes;wire->target_handle=handle;
    wire->target_width=ctx->color->width;wire->target_height=ctx->color->height;
    wire->vertex_count=triangle_count;
@@ -658,6 +713,11 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    v3->index_count=index_count;
    v3->uniform_bytes=0;
    v3->reserved=0;
+   struct rdmetal_draw_header_v4 *v4=(void *)wire;
+   v4->scissor_x=sx;
+   v4->scissor_y=sy;
+   v4->scissor_width=ex-sx;
+   v4->scissor_height=ey-sy;
    uint8_t *payload=(uint8_t *)wire+header_bytes;
    memcpy(payload,vs,vs_count*sizeof(uint32_t));
    payload+=vs_count*sizeof(uint32_t);
@@ -667,20 +727,21 @@ static void rdmetal_draw_vbo(struct pipe_context *p,
    payload+=vertex_bytes;
    if(indexed){ memcpy(payload,index_data,index_bytes); }
    if(getenv("RDMETAL_TRACE_DRAW"))
-      fprintf(stderr,"RDMETAL_DRAW_PACKET v3 textured=%d th=%llu tg=%llu target=%llu bytes=%zu vs=%zu fs=%zu idx=%u uv=%d\n",
+      fprintf(stderr,"RDMETAL_DRAW_PACKET v4 textured=%d th=%llu tg=%llu target=%llu bytes=%zu vs=%zu fs=%zu idx=%u uv=%d scissor=%u,%u %ux%u\n",
               textured,(unsigned long long)texture_handle,(unsigned long long)texture_generation,
-              (unsigned long long)handle,bytes,vs_count,fs_count,index_count,has_uv);
+              (unsigned long long)handle,bytes,vs_count,fs_count,index_count,has_uv,
+              sx,sy,ex-sx,ey-sy);
    long fence=ctx->draw_submit(ctx->draw_opaque,wire,bytes);
    if(getenv("RDMETAL_TRACE_DRAW"))
       fprintf(stderr,"RDMETAL_DRAW_SUBMIT fence=%ld errno=%d\n",fence,errno);
-   if(fence<=0)ctx->failed=true;
+   if(fence<=0)RDMETAL_FAIL(ctx);
    else ctx->draw_fences[ctx->draw_fence_count++]=fence;
    free(out_vertices);
    free(wire);
 }
 
 static void rdmetal_bind_unsupported_shader(struct pipe_context *p, void *s)
-{ if (s) self(p)->failed = true; }
+{ if (s) RDMETAL_FAIL(self(p)); }
 /* Create the softpipe half of a hybrid shader state. Both rdmetal_shader_create
  * and softpipe's create_*_state take ownership of the app NIR and free it, so
  * the two halves cannot share one nir_shader. softpipe receives a deep clone. */
@@ -777,7 +838,7 @@ static void rdmetal_set_stencil_ref(struct pipe_context *p,
       {
          RDMETAL_SP_LOCK(); ctx->softpipe->set_stencil_ref(ctx->softpipe, s); RDMETAL_SP_UNLOCK();
       }
-   if (s.ref_value[0] || s.ref_value[1]) ctx->failed = true;
+   if (s.ref_value[0] || s.ref_value[1]) RDMETAL_FAIL(ctx);
 }
 static void rdmetal_set_sample_mask(struct pipe_context *p, unsigned mask)
 {
@@ -786,7 +847,7 @@ static void rdmetal_set_sample_mask(struct pipe_context *p, unsigned mask)
       {
          RDMETAL_SP_LOCK(); ctx->softpipe->set_sample_mask(ctx->softpipe, mask); RDMETAL_SP_UNLOCK();
       }
-   if (mask != ~0u) ctx->failed = true;
+   if (mask != ~0u) RDMETAL_FAIL(ctx);
 }
 static void rdmetal_set_polygon_stipple(struct pipe_context *p,
                                         const struct pipe_poly_stipple *pattern)
@@ -796,11 +857,11 @@ static void rdmetal_set_polygon_stipple(struct pipe_context *p,
       {
          RDMETAL_SP_LOCK(); ctx->softpipe->set_polygon_stipple(ctx->softpipe, pattern); RDMETAL_SP_UNLOCK();
       }
-   if (!pattern) { ctx->failed = true; return; }
+   if (!pattern) { RDMETAL_FAIL(ctx); return; }
    /* The state tracker sends this even for a default GLES draw. Keep the
     * normal all-on mask, and reject actual stippling until it is rendered. */
    for (unsigned i = 0; i < 32; i++)
-      if (pattern->stipple[i] != ~0u) { ctx->failed = true; return; }
+      if (pattern->stipple[i] != ~0u) { RDMETAL_FAIL(ctx); return; }
 }
 static void rdmetal_set_window_rectangles(struct pipe_context *p,
                                           bool include,unsigned count,
@@ -813,7 +874,7 @@ static void rdmetal_set_window_rectangles(struct pipe_context *p,
       }
    /* No window rectangles is the standard GLES state. Nonempty clipping
     * needs an actual Metal scissor/region implementation. */
-   if (include || count) ctx->failed = true;
+   if (include || count) RDMETAL_FAIL(ctx);
 }
 static void rdmetal_set_blend_color(struct pipe_context *p,
                                     const struct pipe_blend_color *color)
@@ -823,7 +884,7 @@ static void rdmetal_set_blend_color(struct pipe_context *p,
       {
          RDMETAL_SP_LOCK(); ctx->softpipe->set_blend_color(ctx->softpipe, color); RDMETAL_SP_UNLOCK();
       }
-   if (!color) { ctx->failed = true; return; }
+   if (!color) { RDMETAL_FAIL(ctx); return; }
    ctx->blend_color = *color;
 }
 static void rdmetal_set_viewport_states(struct pipe_context *p,
@@ -835,7 +896,7 @@ static void rdmetal_set_viewport_states(struct pipe_context *p,
       {
          RDMETAL_SP_LOCK(); ctx->softpipe->set_viewport_states(ctx->softpipe, first, count, states); RDMETAL_SP_UNLOCK();
       }
-   if (first || count != 1 || !states) { ctx->failed=true; return; }
+   if (first || count != 1 || !states) { RDMETAL_FAIL(ctx); return; }
    ctx->viewport=states[0];
    ctx->have_viewport=true;
 }
@@ -849,7 +910,7 @@ static void rdmetal_set_scissor_states(struct pipe_context *p,
       ctx->softpipe->set_scissor_states(ctx->softpipe, first, count, states);
       RDMETAL_SP_UNLOCK();
    }
-   if (first || !count || !states) { ctx->failed = true; return; }
+   if (first || !count || !states) { RDMETAL_FAIL(ctx); return; }
    /* This bounded direct renderer has one viewport. Other viewports may be
     * initialized by Mesa, but they cannot affect a one-viewport draw. */
    ctx->scissor = states[0];
@@ -998,7 +1059,7 @@ static void rdmetal_bind_sampler_states(struct pipe_context *p,
     * shader stage. Empty slots are no-ops for the bounded Metal renderer. */
    if(empty){if(shader==PIPE_SHADER_FRAGMENT && start==0)ctx->fragment_sampler=NULL;return;}
    if(shader!=PIPE_SHADER_FRAGMENT||start||count>1||
-      !states){ctx->failed=true;return;}
+      !states){RDMETAL_FAIL(ctx);return;}
    ctx->fragment_sampler=count?states[0]:NULL;
 }
 static void rdmetal_set_sampler_views(struct pipe_context *p,
@@ -1030,7 +1091,7 @@ static void rdmetal_set_sampler_views(struct pipe_context *p,
       return;
    }
    if(shader!=PIPE_SHADER_FRAGMENT||start||count>1||trailing>1||
-      !views){ctx->failed=true;return;}
+      !views){RDMETAL_FAIL(ctx);return;}
    struct pipe_sampler_view *view=count?views[0]:NULL;
    if(view){
       /* The bounded Metal path samples either a promoted RGBA8 sample texture
@@ -1041,7 +1102,7 @@ static void rdmetal_set_sampler_views(struct pipe_context *p,
             &(uint64_t){0},&(uint64_t){0});
       const bool direct_sample = rdmetal_direct_resource_owns(view->texture);
       if(view->context!=p||view->target!=PIPE_TEXTURE_2D||
-         !(metal_sample||direct_sample)){ctx->failed=true;return;}
+         !(metal_sample||direct_sample)){RDMETAL_FAIL(ctx);return;}
    }
    if(take_ownership){
       pipe_sampler_view_reference(&ctx->fragment_view,NULL);
@@ -1060,7 +1121,7 @@ static void rdmetal_set_shader_buffers(struct pipe_context *p,
                                         buffers, writable); RDMETAL_SP_UNLOCK();
       }
    for (unsigned i=0; i<count; i++) if (buffers && buffers[i].buffer)
-      ctx->failed=true;
+      RDMETAL_FAIL(ctx);
 }
 static void rdmetal_set_shader_images(struct pipe_context *p,
    enum pipe_shader_type shader, unsigned start, unsigned count,
@@ -1073,7 +1134,7 @@ static void rdmetal_set_shader_images(struct pipe_context *p,
                                        trailing, images); RDMETAL_SP_UNLOCK();
       }
    for (unsigned i=0; i<count; i++) if (images && images[i].resource)
-      ctx->failed=true;
+      RDMETAL_FAIL(ctx);
 }
 static void rdmetal_set_stream_output_targets(struct pipe_context *p,
    unsigned count, struct pipe_stream_output_target **targets,
@@ -1085,7 +1146,7 @@ static void rdmetal_set_stream_output_targets(struct pipe_context *p,
          RDMETAL_SP_LOCK(); ctx->softpipe->set_stream_output_targets(ctx->softpipe, count, targets, offsets); RDMETAL_SP_UNLOCK();
       }
    for (unsigned i=0; i<count; i++) if (targets && targets[i])
-      ctx->failed=true;
+      RDMETAL_FAIL(ctx);
 }
 
 static struct rdmetal_clear_context *self(struct pipe_context *context)
@@ -1096,9 +1157,9 @@ static struct rdmetal_clear_context *self(struct pipe_context *context)
 static bool rdmetal_wait(struct rdmetal_clear_context *ctx)
 {
    if(!ctx->producer_fence&&!ctx->draw_fence_count)return true;
-   if(!ctx->color){ctx->failed=true;return false;}
+   if(!ctx->color){RDMETAL_FAIL(ctx);return false;}
    const long handle=rdmetal_direct_resource_handle(ctx->color->texture);
-   if(!handle||!ctx->draw_poll){ctx->failed=true;return false;}
+   if(!handle||!ctx->draw_poll){RDMETAL_FAIL(ctx);return false;}
    /* One bounded wait for the whole batch, not one wait per draw. Incomplete
     * work retains the surface reference and prevents export/release. */
    for(unsigned attempt=0;attempt<200;attempt++){
@@ -1107,19 +1168,19 @@ static bool rdmetal_wait(struct rdmetal_clear_context *ctx)
          int status=rdmetal_direct_resource_wait(ctx->color->texture,ctx->producer_fence);
          if(status==0)ctx->producer_fence=0;
          else if(status==-EAGAIN)pending=true;
-         else {if(getenv("RDMETAL_TRACE_DRAW"))fprintf(stderr,"RDMETAL_WAIT_CLEAR_FAILED status=%d fence=%ld\n",status,ctx->producer_fence);ctx->failed=true;return false;}
+         else {if(getenv("RDMETAL_TRACE_DRAW"))fprintf(stderr,"RDMETAL_WAIT_CLEAR_FAILED status=%d fence=%ld\n",status,ctx->producer_fence);RDMETAL_FAIL(ctx);return false;}
       }
       for(unsigned i=0;i<ctx->draw_fence_count;i++)if(ctx->draw_fences[i]){
          int status=ctx->draw_poll(ctx->poll_opaque,handle,ctx->draw_fences[i]);
          if(status==0)ctx->draw_fences[i]=0;
          else if(status==-EAGAIN)pending=true;
-         else {if(getenv("RDMETAL_TRACE_DRAW"))fprintf(stderr,"RDMETAL_WAIT_DRAW_FAILED status=%d fence=%ld handle=%ld\n",status,ctx->draw_fences[i],handle);ctx->failed=true;return false;}
+         else {if(getenv("RDMETAL_TRACE_DRAW"))fprintf(stderr,"RDMETAL_WAIT_DRAW_FAILED status=%d fence=%ld handle=%ld\n",status,ctx->draw_fences[i],handle);RDMETAL_FAIL(ctx);return false;}
       }
       if(!pending){ctx->draw_fence_count=0;return true;}
       usleep(1000);
    }
    if(getenv("RDMETAL_TRACE_DRAW"))fprintf(stderr,"RDMETAL_WAIT_TIMEOUT clear=%ld draw_count=%u handle=%ld\n",ctx->producer_fence,ctx->draw_fence_count,handle);
-   ctx->failed=true;
+   RDMETAL_FAIL(ctx);
    return false;
 }
 
@@ -1130,8 +1191,9 @@ static void rdmetal_destroy_context(struct pipe_context *context)
       u_upload_destroy(ctx->base.stream_uploader);
    ctx->base.stream_uploader = NULL;
    ctx->base.const_uploader = NULL;
-   if (!ctx->vertex_buffer.is_user_buffer)
-      pipe_resource_reference(&ctx->vertex_buffer.buffer.resource,NULL);
+   for (unsigned i=0;i<2;i++)
+      if (!ctx->vertex_buffers[i].is_user_buffer)
+         pipe_resource_reference(&ctx->vertex_buffers[i].buffer.resource,NULL);
    pipe_resource_reference(&ctx->vs_const.buffer,NULL);
    if(rdmetal_wait(ctx))pipe_surface_reference(&ctx->color,NULL);
    pipe_sampler_view_reference(&ctx->fragment_view,NULL);
@@ -1225,10 +1287,10 @@ static void rdmetal_clear(struct pipe_context *context,unsigned buffers,
    }
    if(!rdmetal_wait(ctx))return;
    if(ctx->failed||!color||scissor||buffers!=PIPE_CLEAR_COLOR0){
-      ctx->failed=true;return;
+      RDMETAL_FAIL(ctx);return;
    }
    ctx->producer_fence=rdmetal_direct_resource_clear_rgba(ctx->color->texture,color->f);
-   if(ctx->producer_fence<=0)ctx->failed=true;
+   if(ctx->producer_fence<=0)RDMETAL_FAIL(ctx);
 }
 
 static void rdmetal_flush(struct pipe_context *context,
@@ -1248,9 +1310,9 @@ static void rdmetal_flush_resource(struct pipe_context *context,
                                    struct pipe_resource *resource)
 {
    struct rdmetal_clear_context *ctx=self(context);
-   if(!resource){ctx->failed=true;return;}
+   if(!resource){RDMETAL_FAIL(ctx);return;}
    if(rdmetal_direct_resource_owns(resource)){
-      if(!rdmetal_wait(ctx))ctx->failed=true;
+      if(!rdmetal_wait(ctx))RDMETAL_FAIL(ctx);
       return;
    }
    if (ctx->softpipe)
@@ -1290,7 +1352,7 @@ static void *rdmetal_texture_map(struct pipe_context *p,
 {
    struct rdmetal_clear_context *ctx = self(p);
    if (!resource || !box || !out) {
-      ctx->failed = true;
+      RDMETAL_FAIL(ctx);
       return NULL;
    }
    /* Delegate softpipe resources to the fallback context so their real CPU
@@ -1305,7 +1367,7 @@ static void *rdmetal_texture_map(struct pipe_context *p,
          return map;
    }
    if (level || box->width < 0 || box->height < 0 || box->depth < 0) {
-      ctx->failed = true;
+      RDMETAL_FAIL(ctx);
       return NULL;
    }
    unsigned blocksize = util_format_get_blocksize(resource->format);
@@ -1314,7 +1376,7 @@ static void *rdmetal_texture_map(struct pipe_context *p,
       bytes = 1;
    struct rdmetal_texture_transfer *t = calloc(1, sizeof(*t) + bytes);
    if (!t) {
-      ctx->failed = true;
+      RDMETAL_FAIL(ctx);
       return NULL;
    }
    pipe_resource_reference(&t->base.resource, resource);
@@ -1360,7 +1422,7 @@ static void rdmetal_texture_unmap(struct pipe_context *p,
           box->width != res->width0 || box->height != res->height0 ||
           rdmetal_direct_resource_upload(transfer->resource, t->data,
              (size_t)res->width0 * res->height0 * 4))
-         ctx->failed = true;
+         RDMETAL_FAIL(ctx);
    }
    if (transfer->resource && rdmetal_sample_resource_owns(transfer->resource)) {
       const struct rdmetal_texture_transfer *t =
@@ -1371,7 +1433,7 @@ static void rdmetal_texture_unmap(struct pipe_context *p,
           box->width != res->width0 || box->height != res->height0 ||
           rdmetal_sample_resource_upload(transfer->resource, t->data,
              (size_t)res->width0 * res->height0 * 4))
-         ctx->failed = true;
+         RDMETAL_FAIL(ctx);
    }
    pipe_resource_reference(&transfer->resource, NULL);
    free(transfer);
@@ -1392,7 +1454,7 @@ static void rdmetal_buffer_subdata(struct pipe_context *p,
    (void)usage;
    if (!resource || !data || !size) return;
    void *dst = rdmetal_cpu_buffer_data_writable(resource, offset, size);
-   if (!dst) { self(p)->failed = true; return; }
+   if (!dst) { RDMETAL_FAIL(self(p)); return; }
    memcpy(dst, data, size);
 }
 
@@ -1404,7 +1466,7 @@ static void rdmetal_texture_subdata(struct pipe_context *p,
                                     uintptr_t layer_stride)
 {
    (void)usage; (void)layer_stride;
-   if (!resource || !box || !data || level) { self(p)->failed = true; return; }
+   if (!resource || !box || !data || level) { RDMETAL_FAIL(self(p)); return; }
    if(getenv("RDMETAL_TRACE_TEXTURE"))
       fprintf(stderr,"RDMETAL_TEXTURE_SUBDATA owns=%d box=%ux%u+%d,%d stride=%u\n",
               rdmetal_sample_resource_owns(resource),
@@ -1415,35 +1477,29 @@ static void rdmetal_texture_subdata(struct pipe_context *p,
    if (rdmetal_sample_resource_owns(resource)) {
       if (box->x || box->y || box->z || box->depth != 1 ||
           box->width != resource->width0 || box->height != resource->height0) {
-         self(p)->failed = true;
+         RDMETAL_FAIL(self(p));
          return;
       }
       if (rdmetal_sample_resource_upload(resource, data,
              (size_t)resource->width0 * resource->height0 * 4))
-         self(p)->failed = true;
+         RDMETAL_FAIL(self(p));
    }
    if (rdmetal_direct_resource_owns(resource)) {
-      if (box->x || box->y || box->z || box->depth != 1 ||
-          box->width != resource->width0 || box->height != resource->height0 ||
-          stride < resource->width0 * 4) {
-         self(p)->failed = true;
+      if (box->x < 0 || box->y < 0 || box->z || box->depth != 1 ||
+          box->width <= 0 || box->height <= 0 ||
+          stride < (uint64_t)box->width * 4) {
+         RDMETAL_FAIL(self(p));
          return;
       }
-      const size_t row_bytes = (size_t)resource->width0 * 4;
-      const size_t bytes = row_bytes * resource->height0;
-      const void *upload = data;
-      void *packed = NULL;
-      if (stride != row_bytes) {
-         packed = malloc(bytes);
-         if (!packed) { self(p)->failed = true; return; }
-         for (unsigned y = 0; y < resource->height0; y++)
-            memcpy((char *)packed + y * row_bytes,
-                   (const char *)data + (size_t)y * stride, row_bytes);
-         upload = packed;
+      int upload_status = rdmetal_direct_resource_upload_region(resource, data,
+         (uint32_t)box->x,(uint32_t)box->y,(uint32_t)box->width,
+         (uint32_t)box->height,stride);
+      if (upload_status) {
+         if (getenv("RDMETAL_TRACE_TEXTURE"))
+            fprintf(stderr,"RDMETAL_DIRECT_UPLOAD_FAIL status=%d fmt=%u box=%dx%d+%d,%d stride=%u\n",
+                    upload_status,resource->format,box->width,box->height,box->x,box->y,stride);
+         RDMETAL_FAIL(self(p));
       }
-      if (rdmetal_direct_resource_upload(resource, upload, bytes))
-         self(p)->failed = true;
-      free(packed);
    }
 }
 
@@ -1482,6 +1538,11 @@ struct pipe_context *rdmetal_clear_context_create(struct pipe_screen *screen,
    ctx->draw_poll=getenv("RDMETAL_MOCK_BROKER") ?
       rdmetal_draw_mock_poll : rdmetal_draw_guest_poll;
    ctx->base.destroy=rdmetal_destroy_context;
+   ctx->base.create_query=rdmetal_create_query;
+   ctx->base.destroy_query=rdmetal_destroy_query;
+   ctx->base.begin_query=rdmetal_begin_query;
+   ctx->base.end_query=rdmetal_end_query;
+   ctx->base.get_query_result=rdmetal_get_query_result;
    ctx->base.create_surface=rdmetal_create_surface;
    ctx->base.surface_destroy=rdmetal_surface_destroy;
    ctx->base.set_framebuffer_state=rdmetal_set_framebuffer;

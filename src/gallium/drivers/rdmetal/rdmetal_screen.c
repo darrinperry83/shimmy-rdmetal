@@ -98,6 +98,10 @@ rdmetal_resource_get_handle(struct pipe_screen *screen, struct pipe_context *ctx
    long fd = syscall(0x2002L, 11L, handle, res->width0, res->height0, 0L, 0L);
    if (fd < 0 || fd > INT32_MAX)
       return false;
+   if (!rdmetal_direct_resource_hold_for_import(res)) {
+      close((int)fd);
+      return false;
+   }
    out->handle = (unsigned)fd;
    if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
       fprintf(stderr, "RDMESA_DMABUF_FD exact_image=1 fd=%ld\n", fd);
@@ -114,6 +118,17 @@ rdmetal_get_param(struct pipe_screen *screen, enum pipe_cap param)
 {
    if (param == PIPE_CAP_DMABUF)
       return DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
+   /* The direct Metal path has no GPU query/fence timestamp implementation.
+    * Do not inherit softpipe's query advertisement for this context. */
+   if (param == PIPE_CAP_OCCLUSION_QUERY ||
+       param == PIPE_CAP_QUERY_TIME_ELAPSED ||
+       param == PIPE_CAP_QUERY_TIMESTAMP ||
+       param == PIPE_CAP_QUERY_TIMESTAMP_BITS ||
+       param == PIPE_CAP_TIMER_RESOLUTION ||
+       param == PIPE_CAP_QUERY_PIPELINE_STATISTICS ||
+       param == PIPE_CAP_QUERY_PIPELINE_STATISTICS_SINGLE ||
+       param == PIPE_CAP_QUERY_BUFFER_OBJECT)
+      return 0;
    return softpipe_get_param_cb ? softpipe_get_param_cb(screen, param) : 0;
 }
 
@@ -297,6 +312,7 @@ static void
 rdmetal_screen_destroy(struct pipe_screen *screen)
 {
    rdmetal_owner_forget_screen(screen);
+   rdmetal_direct_resource_release_pending_screen(screen);
    pthread_mutex_lock(&rdmetal_fallback_lock);
    struct rdmetal_fallback **link = &rdmetal_fallbacks;
    while (*link && (*link)->owner != screen) link = &(*link)->next;

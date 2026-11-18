@@ -17,9 +17,16 @@ struct rdmetal_direct_resource {
    struct rdmetal_direct_resource *next;
    struct rdmetal_image_export_v1 export_image;
    bool exported;
+   bool pending_fd_import;
 };
 static pthread_mutex_t rdmetal_resource_lock=PTHREAD_MUTEX_INITIALIZER;
 static struct rdmetal_direct_resource *rdmetal_resources;
+static unsigned rdmetal_pending_imports;
+static uint64_t rdmetal_pending_bytes;
+#define RDMETAL_MAX_PENDING_IMPORTS 8u
+#define RDMETAL_MAX_PENDING_BYTES (256ull * 1024ull * 1024ull)
+static uint64_t import_cost(const struct rdmetal_direct_resource *node)
+{ return (uint64_t)node->base.width0 * node->base.height0 * 4u; }
 
 bool rdmetal_direct_resource_owns(const struct pipe_resource *resource)
 {
@@ -140,6 +147,27 @@ rdmetal_direct_resource_handle(const struct pipe_resource *resource)
    return res->broker_handle;
 }
 
+bool
+rdmetal_direct_resource_hold_for_import(struct pipe_resource *resource)
+{
+   pthread_mutex_lock(&rdmetal_resource_lock);
+   struct rdmetal_direct_resource *node = rdmetal_resources;
+   while (node && &node->base != resource)
+      node = node->next;
+   uint64_t cost = node ? import_cost(node) : 0;
+   bool held = node && !node->pending_fd_import &&
+               rdmetal_pending_imports < RDMETAL_MAX_PENDING_IMPORTS &&
+               cost <= RDMETAL_MAX_PENDING_BYTES - rdmetal_pending_bytes;
+   if (held) {
+      pipe_reference(NULL, &node->base.reference);
+      node->pending_fd_import = true;
+      rdmetal_pending_imports++;
+      rdmetal_pending_bytes += cost;
+   }
+   pthread_mutex_unlock(&rdmetal_resource_lock);
+   return held;
+}
+
 struct pipe_resource *
 rdmetal_direct_resource_find(struct pipe_screen *screen, long handle)
 {
@@ -149,10 +177,42 @@ rdmetal_direct_resource_find(struct pipe_screen *screen, long handle)
    while (node && node->broker_handle != handle)
       node = node->next;
    struct pipe_resource *found = node ? &node->base : NULL;
-   if (found)
+   if (found) {
       pipe_reference(NULL, &found->reference); /* +1 for the caller */
+      if (node->pending_fd_import) {
+         node->pending_fd_import = false;
+         rdmetal_pending_imports--;
+         rdmetal_pending_bytes -= import_cost(node);
+         /* Transfer the export hold to the authenticated importer. */
+         pipe_reference(&found->reference, NULL);
+      }
+   }
    pthread_mutex_unlock(&rdmetal_resource_lock);
    return found;
+}
+
+/* An exported FD might never be imported. The temporary Mesa lifetime hold
+ * must not survive destruction of its screen. The global count also bounds
+ * unconsumed holds while a screen remains live. */
+void rdmetal_direct_resource_release_pending_screen(struct pipe_screen *screen)
+{
+   pthread_mutex_lock(&rdmetal_resource_lock);
+   struct rdmetal_direct_resource **link=&rdmetal_resources;
+   while(*link){
+      struct rdmetal_direct_resource *node=*link;
+      if(node->base.screen!=screen || !node->pending_fd_import){
+         link=&node->next; continue;
+      }
+      node->pending_fd_import=false;
+      rdmetal_pending_imports--;
+      rdmetal_pending_bytes-=import_cost(node);
+      if(pipe_reference(&node->base.reference,NULL) &&
+         node->release(node->broker_handle)==0){
+         *link=node->next;
+         free(node);
+      }else link=&node->next;
+   }
+   pthread_mutex_unlock(&rdmetal_resource_lock);
 }
 
 long
@@ -210,5 +270,27 @@ rdmetal_direct_resource_upload(struct pipe_resource *resource,
    long result = syscall(0x2002L, 14L,
                          rdmetal_direct_resource_handle(resource),
                          (long)pixels, (long)bytes, format, 0L);
+   return result == 0 ? 0 : result == -1 ? -errno : -EIO;
+}
+int rdmetal_direct_resource_upload_region(struct pipe_resource *resource,
+                                   const void *pixels,uint32_t x,uint32_t y,
+                                   uint32_t width,uint32_t height,uint32_t stride)
+{
+   if (!resource || !pixels || !rdmetal_direct_resource_owns(resource) ||
+       !width || !height || x > resource->width0 || y > resource->height0 ||
+       width > resource->width0-x || height > resource->height0-y ||
+       stride < (uint64_t)width*4) return -EINVAL;
+   uint32_t format;
+   switch (resource->format) {
+   case PIPE_FORMAT_B8G8R8A8_UNORM: format = 1; break;
+   case PIPE_FORMAT_R8G8B8A8_UNORM: format = 2; break;
+   case PIPE_FORMAT_B8G8R8X8_UNORM: format = 3; break;
+   default: return -EINVAL;
+   }
+   long result = syscall(0x2002L,15L,
+       rdmetal_direct_resource_handle(resource),(long)pixels,
+       (long)(((uint64_t)x<<32)|y),
+       (long)(((uint64_t)width<<32)|height),
+       (long)(((uint64_t)format<<32)|stride));
    return result == 0 ? 0 : result == -1 ? -errno : -EIO;
 }
