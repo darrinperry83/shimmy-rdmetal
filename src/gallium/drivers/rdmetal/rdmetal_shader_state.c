@@ -153,8 +153,15 @@ static bool rdmetal_nir_supported_resources(const nir_shader *nir, bool fragment
                                    nir_var_uniform | nir_var_mem_push_const) {
       if (var->data.mode == nir_var_mem_push_const)
          return false;
-      if (!glsl_type_is_sampler(glsl_without_array(var->type)))
-         return false; /* plain uniform the adapter does not bind */
+      if (glsl_type_is_sampler(glsl_without_array(var->type)))
+         continue;
+      /* A non-sampler plain uniform. nir_lower_uniforms_to_ubo leaves the
+       * original variable (e.g. qt_Matrix mat4) in the list as DEAD after it
+       * lowers the accesses to a single UBO, so tolerate it when exactly one
+       * UBO is present. A live plain uniform (no UBO) has nowhere for the
+       * adapter to bind it, so decline the real path. */
+      if (nir->info.num_ubos == 0)
+         return false;
    }
    return true;
 }
