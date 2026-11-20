@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 
 #define IOC_NRSHIFT    0
 #define IOC_TYPESHIFT  8
@@ -400,7 +401,12 @@ static void gem_release_slot(struct gem_slot* g) {
 // then mmap()s them via GEM_MMAP_OFFSET. The backing is plain host memory, which the guest
 // reads/writes directly (the shim runs the guest in-process), so this is a straight host
 // allocation per BO. Handles live in a separate namespace from the imported-surface slots.
-#define MAX_BO 512
+//
+// The table GROWS on demand. The old fixed MAX_BO=512 limit was a real swapchain bug: the
+// asahi driver populates this table with one BO per command buffer, shader binary, scratch
+// page and timestamp, and a GBM swapchain slot (MODE_CREATE_DUMB) shares the SAME table.
+// Once 512 live BOs accumulated, MODE_CREATE_DUMB returned -ENOMEM and KWin reported
+// "Failed to allocate an egl gbm swapchain graphics buffer".
 struct bo_slot {
   uint32_t handle;
   void*    map;      // canonical host view of the backing, page-aligned (present path reads this)
@@ -409,13 +415,29 @@ struct bo_slot {
   int      used;
   uint32_t refs;     // GEM-style reference count (creator + importers)
 };
-static struct bo_slot g_bo[MAX_BO];
+static struct bo_slot* g_bo;        // grown on demand; never a fixed-capacity ceiling
+static size_t   g_bo_cap;           // number of slots currently allocated
 static uint32_t g_next_bo_handle = 0x40000000u;   // far from imported-surface handles (1..N)
 
 static struct bo_slot* bo_find(uint32_t handle) {
-  for (int i = 0; i < MAX_BO; i++)
+  for (size_t i = 0; i < g_bo_cap; i++)
     if (g_bo[i].used && g_bo[i].handle == handle) return &g_bo[i];
   return NULL;
+}
+
+/* Return a free slot, growing the table when every current slot is live. NULL only on a
+ * genuine host out-of-memory, never on a fixed-slot budget. */
+static struct bo_slot* bo_take_slot(void) {
+  for (size_t i = 0; i < g_bo_cap; i++)
+    if (!g_bo[i].used) return &g_bo[i];
+  size_t oldcap = g_bo_cap;
+  size_t newcap = oldcap ? oldcap * 2 : 64;
+  struct bo_slot* grown = realloc(g_bo, newcap * sizeof *grown);
+  if (!grown) return NULL;
+  memset(grown + oldcap, 0, (newcap - oldcap) * sizeof *grown);
+  g_bo = grown;
+  g_bo_cap = newcap;
+  return &grown[oldcap];
 }
 
 /* Allocate an anonymous backing file (unlinked mkstemp) sized to rlen and map it
@@ -429,7 +451,20 @@ static struct bo_slot* bo_find(uint32_t handle) {
  * the bytes stay live, and each re-mmap is a fresh, valid mapping. */
 static void* bo_backing_map(size_t rlen, int* fd_out) {
   *fd_out = -1;
-  char tmpl[] = "/tmp/rdmetal-bo-XXXXXX";
+  // Mirror mem_fd()'s directory resolution (syscalls.c): an explicit confined dir wins,
+  // then the private per-boot socket group, then TMPDIR, then /tmp. A hardcoded
+  // /tmp/rdmetal-bo-XXXXXX made every MODE_CREATE_DUMB fail with -ENOMEM whenever /tmp
+  // was not writable for the shim (e.g. a restricted tmpdir), which surfaces upstream as
+  // "Failed to allocate an egl gbm swapchain graphics buffer".
+  const char* td = getenv("RDX_MEMFD_DIR");
+  if (!td || !*td) td = getenv("RDSOCKETGROUP");
+  if (!td || !*td) td = getenv("TMPDIR");
+  char tmpl[PATH_MAX];
+  if (td && *td)
+    snprintf(tmpl, sizeof tmpl, "%s%srdmetal-bo-XXXXXX", td,
+             td[strlen(td)-1] == '/' ? "" : "/");
+  else
+    snprintf(tmpl, sizeof tmpl, "/tmp/rdmetal-bo-XXXXXX");
   int fd = mkstemp(tmpl);
   if (fd < 0) return MAP_FAILED;
   unlink(tmpl);
@@ -790,8 +825,7 @@ long drm_ioctl(int fd, unsigned long req, unsigned long arg) {
   if (type == DRM_TYPE && nr == ASAHI_NR_GEM_CREATE && arg) {
     struct asahi_gem_create* c = (struct asahi_gem_create*)arg;
     c->handle = 0;
-    struct bo_slot* slot = NULL;
-    for (int i = 0; i < MAX_BO; i++) if (!g_bo[i].used) { slot = &g_bo[i]; break; }
+    struct bo_slot* slot = bo_take_slot();
     if (slot) {
       size_t rlen = ((size_t)c->size + 4095) & ~(size_t)4095;
       if (rlen == 0) rlen = 4096;
@@ -821,6 +855,9 @@ long drm_ioctl(int fd, unsigned long req, unsigned long arg) {
   if (type == DRM_TYPE && nr == ASAHI_NR_GEM_MMAP_OFFSET && arg) {
     struct asahi_gem_mmap_offset* m = (struct asahi_gem_mmap_offset*)arg;
     struct bo_slot* b = bo_find(m->handle);
+    // offset = handle << 12. Handles start at 0x40000000, so a LIVE handle always yields a
+    // non-zero offset; offset 0 is reserved to mean "unknown/freed handle" (mapped back to
+    // -EINVAL so the caller never mmap()s an offset the shim cannot resolve).
     m->offset = b ? ((uint64_t)m->handle << 12) : 0;
     if (tracing())
       fprintf(stderr, "[drm] ASAHI GEM_MMAP_OFFSET handle=0x%x -> offset=0x%llx%s\n",
@@ -844,8 +881,7 @@ long drm_ioctl(int fd, unsigned long req, unsigned long arg) {
     }
     uint32_t pitch = (uint32_t)(((uint64_t)c->width * (c->bpp / 8) + 63u) & ~63u);
     uint64_t size = (uint64_t)pitch * c->height;
-    struct bo_slot* slot = NULL;
-    for (int i = 0; i < MAX_BO; i++) if (!g_bo[i].used) { slot = &g_bo[i]; break; }
+    struct bo_slot* slot = bo_take_slot();
     if (!slot || size == 0 || size > (1ull << 30)) {
       if (tracing()) fprintf(stderr, "[drm] MODE_CREATE_DUMB %ux%u -> -ENOMEM\n",
                              c->width, c->height);
@@ -877,7 +913,8 @@ long drm_ioctl(int fd, unsigned long req, unsigned long arg) {
 
   // MODE_MAP_DUMB: return the fake mmap offset for the handle. Reuses the GEM
   // scheme (offset = handle << 12) so syscall 222 (mmap) resolves through
-  // drm_mmap_bo() to the same host backing.
+  // drm_mmap_bo() to the same host backing. Handles start at 0x40000000, so a live
+  // handle always maps to a non-zero offset; offset 0 means "freed/unknown".
   if (type == DRM_TYPE && nr == DRM_NR_MODE_MAP_DUMB && arg) {
     struct drm_mode_map_dumb* m = (struct drm_mode_map_dumb*)arg;
     struct bo_slot* b = bo_find(m->handle);
