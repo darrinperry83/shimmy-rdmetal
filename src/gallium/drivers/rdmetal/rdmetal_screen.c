@@ -11,6 +11,7 @@
 #include "rdmetal_cpu_buffer.h"
 #include "frontend/winsys_handle.h"
 #include "drm-uapi/drm.h"
+#include "drm-uapi/drm_fourcc.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -202,6 +203,35 @@ static const struct rdmetal_direct_ops rdmetal_mock_ops = {
    rdmetal_mock_wait, rdmetal_mock_release
 };
 
+/* A foreign dma-buf arrives as a single-plane, tightly packed BGRA8 IOSurface
+ * carrier (the shim's own DRM node exports exactly that shape via
+ * PRIME_HANDLE_TO_FD / the broker FD export, and the broker minted lease is
+ * BGRA8). Only that shape maps onto the broker's Metal image; a multi-plane
+ * buffer, a tiled modifier, a non-zero plane offset, or a pitch the broker
+ * cannot reproduce all fail closed to the software importer instead of being
+ * adopted with mismatched geometry. */
+static bool
+rdmetal_dmabuf_template_ok(const struct pipe_resource *templ,
+                           const struct winsys_handle *wh)
+{
+   return templ && wh &&
+          wh->type == WINSYS_HANDLE_TYPE_FD &&
+          wh->plane == 0 &&
+          wh->offset == 0 &&
+          (wh->modifier == DRM_FORMAT_MOD_INVALID ||
+           wh->modifier == DRM_FORMAT_MOD_LINEAR) &&
+          wh->format == templ->format &&
+          rdmetal_direct_format_supported(wh->format) &&
+          templ->target == PIPE_TEXTURE_2D &&
+          !templ->last_level && templ->depth0 == 1 &&
+          templ->array_size == 1 && !templ->nr_samples &&
+          templ->width0 && templ->height0 &&
+          templ->width0 <= 4096 && templ->height0 <= 4096 &&
+          wh->stride >= templ->width0 * 4 &&
+          wh->stride <= 4096u * 4u &&
+          !(wh->stride % 4);
+}
+
 /* dma-buf import hook.  In the software bootstrap this defers to softpipe's
  * importer (which is ABI-correct but returns NULL for the sw winsys, i.e. the
  * safe fail-closed result).  In direct mode the compositor re-imports the FD
@@ -216,9 +246,8 @@ rdmetal_resource_from_handle(struct pipe_screen *screen,
                              struct winsys_handle *wh,
                              unsigned usage)
 {
-   if (rdmetal_direct_mode && templ && wh &&
-       wh->type == WINSYS_HANDLE_TYPE_FD &&
-       rdmetal_direct_format_supported(wh->format)) {
+   if (rdmetal_direct_mode &&
+       rdmetal_dmabuf_template_ok(templ, wh)) {
       int fd = (int)wh->handle;
       long handle = syscall(0x2002L, 12L, (long)fd,
                             (long)templ->width0, (long)templ->height0, 0L, 0L);
@@ -237,10 +266,25 @@ rdmetal_resource_from_handle(struct pipe_screen *screen,
          struct pipe_resource *foreign = rdmetal_direct_resource_adopt(
             screen, templ, &rdmetal_broker_ops, handle);
          if (foreign) {
+            /* Confirm the broker's IOSurface pitch equals the dma-buf stride
+             * the exporter advertised. A padded scanline the broker does not
+             * reproduce would sample the wrong rows. */
+            long stride = syscall(0x2002L, 13L, handle,
+                                  (long)templ->width0, (long)templ->height0,
+                                  0L, 0L);
+            if (stride == (long)wh->stride) {
+               if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
+                  fprintf(stderr,
+                          "RDMESA_DMABUF_IMPORT_FOREIGN fd=%d handle=%ld stride=%ld\n",
+                          fd, handle, stride);
+               return foreign;
+            }
             if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
-               fprintf(stderr, "RDMESA_DMABUF_IMPORT_FOREIGN fd=%d handle=%ld\n",
-                       fd, handle);
-            return foreign;
+               fprintf(stderr,
+                       "RDMESA_DMABUF_IMPORT_STRIDE_MISMATCH fd=%d handle=%ld template=%u broker=%ld\n",
+                       fd, handle, wh->stride, stride);
+            rdmetal_direct_resource_destroy(foreign);
+            return NULL;
          }
          fprintf(stderr,
                  "RDMESA_DMABUF_ADOPT_REJECT fd=%d handle=%ld target=%u format=%u bind=%u size=%ux%u depth=%u array=%u level=%u samples=%u\n",
