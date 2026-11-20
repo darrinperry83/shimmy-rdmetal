@@ -18,6 +18,15 @@ def no_core():
 
 
 repo = Path(__file__).resolve().parent.parent
+
+def find_shim(start: Path) -> Path:
+    for d in [start] + list(start.parents):
+        candidate = d / "shim_cli"
+        if candidate.is_file():
+            return candidate
+    raise SystemExit(f"shim_cli not found under {start}")
+
+shim = find_shim(repo)
 with tempfile.TemporaryDirectory(prefix="gbm-bo-group-") as group:
     with tempfile.TemporaryDirectory(prefix="gbm-bo-root-") as root_tmp:
         root = Path(root_tmp)
@@ -31,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix="gbm-bo-group-") as group:
 
         env = os.environ.copy()
         env.update(RDDRM="1", RDSOCKETGROUP=group)
-        result = subprocess.run([str(repo / "shim_cli"), str(root), "/bin/gbm-bo"],
+        result = subprocess.run([str(shim), str(root), "/bin/gbm-bo"],
                                 capture_output=True, text=True, timeout=30,
                                 preexec_fn=no_core, env=env)
         if result.returncode or "GBM_BO_OK" not in result.stdout:
