@@ -115,7 +115,7 @@ index d0f87d9..2e1785f 100644
  
  struct dri2_buffer
  {
-@@ -2424,6 +2437,82 @@ fail:
+@@ -2424,6 +2437,83 @@ fail:
     return NULL;
  }
  
@@ -190,6 +190,7 @@ index d0f87d9..2e1785f 100644
 +   &driCoreExtension.base,
 +   &rdmetalImageMesaCoreExtension.base,
 +   &driImageDriverExtension.base,
++   &swkmsDRI2Extension.base,
 +   &gallium_config_options.base,
 +   NULL,
 +};
