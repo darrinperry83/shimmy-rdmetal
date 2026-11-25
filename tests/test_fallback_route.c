@@ -3,7 +3,7 @@
 #include <stdio.h>
 
 /* Minimal Gallium-shaped fixture for the header's ownership decision. */
-struct pipe_resource { int owner; unsigned width0; unsigned char *data; };
+struct pipe_resource { int owner; unsigned width0, height0; unsigned char *data; };
 struct pipe_surface { struct pipe_resource *texture; };
 struct pipe_vertex_buffer {
    bool is_user_buffer;
@@ -15,7 +15,9 @@ struct pipe_framebuffer_state {
    struct pipe_surface *cbufs[4], *zsbuf;
 };
 static bool rdmetal_direct_resource_owns(const struct pipe_resource *r)
-{ return r && r->owner == 1; }
+{ return r && (r->owner == 1 || r->owner == 4); }
+static bool rdmetal_direct_resource_is_depth(const struct pipe_resource *r)
+{ return r && r->owner == 4; }
 static bool rdmetal_sample_resource_owns(const struct pipe_resource *r)
 { return r && r->owner == 2; }
 static bool rdmetal_cpu_buffer_owns(const struct pipe_resource *r)
@@ -36,6 +38,14 @@ int main(void)
    assert(rdmetal_framebuffer_route(&fb) == RDMETAL_FB_DIRECT);
    fb.zsbuf = &depth;
    assert(rdmetal_framebuffer_route(&fb) == RDMETAL_FB_UNSUPPORTED);
+   struct pipe_resource native_depth = {.owner=4, .width0=16, .height0=16};
+   direct.width0 = direct.height0 = 16;
+   depth.texture = &native_depth;
+   assert(rdmetal_framebuffer_route(&fb) == RDMETAL_FB_DIRECT);
+   native_depth.width0 = 32;
+   assert(rdmetal_framebuffer_route(&fb) == RDMETAL_FB_UNSUPPORTED);
+   native_depth.width0 = 16;
+   depth.texture = &soft;
    fb.zsbuf = NULL;
    fb.samples = 4;
    assert(rdmetal_framebuffer_route(&fb) == RDMETAL_FB_UNSUPPORTED);

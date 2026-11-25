@@ -12,6 +12,8 @@ struct rdmetal_direct_ops {
    long (*clear)(long handle, uint64_t rgba16);
    int (*wait)(long handle, long fence);
    int (*release)(long handle);
+   long (*create_depth)(unsigned width, unsigned height);
+   long (*clear_depth)(long handle, float depth, unsigned stencil, unsigned mask);
 };
 
 /* The compositor renders into RGBA8 (glTexImage GL_RGBA) and scans out
@@ -24,8 +26,24 @@ rdmetal_direct_format_supported(enum pipe_format format)
 {
    return format == PIPE_FORMAT_B8G8R8A8_UNORM ||
           format == PIPE_FORMAT_B8G8R8X8_UNORM ||
-          format == PIPE_FORMAT_R8G8B8A8_UNORM;
+          format == PIPE_FORMAT_R8G8B8A8_UNORM ||
+          format == PIPE_FORMAT_A8_UNORM;
 }
+
+/* Native combined Metal storage also represents depth-only and stencil-only
+ * Gallium renderbuffers. These resources are never exported as color images. */
+static inline bool rdmetal_direct_depth_format_supported(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
+          format == PIPE_FORMAT_Z24X8_UNORM ||
+          format == PIPE_FORMAT_Z32_FLOAT ||
+          format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT ||
+          format == PIPE_FORMAT_Z16_UNORM || format == PIPE_FORMAT_S8_UINT;
+}
+bool rdmetal_direct_resource_is_depth(const struct pipe_resource *resource);
+long rdmetal_direct_resource_clear_depth(struct pipe_resource *resource,
+                                          float depth, unsigned stencil,
+                                          unsigned mask);
 
 struct pipe_resource *rdmetal_direct_resource_create(
    struct pipe_screen *screen, const struct pipe_resource *templ,

@@ -1974,6 +1974,12 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
 #undef BUILTIN_UNOP
 #undef BUILTIN_UNOPF
 
+   case nir_op_fsat:
+      result = emit_builtin_triop(ctx, GLSLstd450FClamp, dest_type, src[0],
+                                 get_fvec_constant(ctx, bit_size, num_components, 0),
+                                 get_fvec_constant(ctx, bit_size, num_components, 1));
+      break;
+
    case nir_op_frcp:
       assert(nir_op_infos[alu->op].num_inputs == 1);
       result = emit_binop(ctx, SpvOpFDiv, dest_type,
@@ -2049,6 +2055,7 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
       result = emit_builtin_binop(ctx, spirv_op, dest_type, src[0], src[1]); \
       break;
 
+   BUILTIN_BINOP(nir_op_fpow, GLSLstd450Pow)
    BUILTIN_BINOP(nir_op_fmin, GLSLstd450FMin)
    BUILTIN_BINOP(nir_op_fmax, GLSLstd450FMax)
    BUILTIN_BINOP(nir_op_imin, GLSLstd450SMin)

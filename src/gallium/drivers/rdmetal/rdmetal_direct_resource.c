@@ -12,6 +12,7 @@ struct rdmetal_direct_resource {
    struct pipe_resource base;
    long broker_handle;
    long (*clear)(long handle, uint64_t rgba16);
+   long (*clear_depth)(long handle, float depth, unsigned stencil, unsigned mask);
    int (*wait)(long handle, long fence);
    int (*release)(long handle);
    struct rdmetal_direct_resource *next;
@@ -37,6 +38,12 @@ bool rdmetal_direct_resource_owns(const struct pipe_resource *resource)
    return node!=NULL;
 }
 
+bool rdmetal_direct_resource_is_depth(const struct pipe_resource *resource)
+{
+   return resource && rdmetal_direct_depth_format_supported(resource->format) &&
+          rdmetal_direct_resource_owns(resource);
+}
+
 struct pipe_resource *
 rdmetal_direct_resource_create(struct pipe_screen *screen,
                                const struct pipe_resource *templ,
@@ -46,17 +53,22 @@ rdmetal_direct_resource_create(struct pipe_screen *screen,
       fprintf(stderr,"RDMESA_IMAGE_ALLOC target=%u format=%u bind=%u size=%ux%u samples=%u\n",
               templ->target,templ->format,templ->bind,templ->width0,
               templ->height0,templ->nr_samples);
-   if (!screen || !templ || !ops || !ops->create_bgra8 || !ops->clear ||
+   bool depth = templ && rdmetal_direct_depth_format_supported(templ->format);
+   if (!screen || !templ || !ops ||
+       (depth ? (!ops->create_depth || !ops->clear_depth) :
+                (!ops->create_bgra8 || !ops->clear)) ||
        !ops->wait || !ops->release ||
        templ->target != PIPE_TEXTURE_2D ||
-       !rdmetal_direct_format_supported(templ->format) ||
-       !(templ->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW)) ||
+       !(depth || rdmetal_direct_format_supported(templ->format)) ||
+       !(templ->bind & (depth ? PIPE_BIND_DEPTH_STENCIL :
+                       (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW))) ||
        templ->last_level || templ->depth0 != 1 || templ->array_size != 1 ||
        templ->nr_samples || !templ->width0 || !templ->height0 ||
        templ->width0 > 4096 || templ->height0 > 4096)
       return NULL;
 
-   long handle = ops->create_bgra8(templ->width0, templ->height0);
+   long handle = depth ? ops->create_depth(templ->width0, templ->height0) :
+                         ops->create_bgra8(templ->width0, templ->height0);
    if (getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
       fprintf(stderr,"RDMESA_DIRECT_CREATE_HANDLE handle=%ld\n",handle);
    if (handle <= 0)
@@ -71,6 +83,7 @@ rdmetal_direct_resource_create(struct pipe_screen *screen,
    res->base.screen = screen;
    res->broker_handle = handle;
    res->clear = ops->clear;
+   res->clear_depth = ops->clear_depth;
    res->wait = ops->wait;
    res->release = ops->release;
    pthread_mutex_lock(&rdmetal_resource_lock);
@@ -134,7 +147,7 @@ int rdmetal_direct_resource_export(struct pipe_resource *resource,
                                    struct rdmetal_image_export_v1 *out)
 {
    const bool owned=rdmetal_direct_resource_owns(resource);
-   if(!out||!owned){
+   if(!out||!owned||rdmetal_direct_resource_is_depth(resource)){
       if(getenv("RDMETAL_AUDIT_WAYLAND_PATH"))
          fprintf(stderr,"RDMESA_DRI_EXPORT_FAIL owned=%d output=%d\n",owned,out!=NULL);
       return 0;
@@ -190,7 +203,8 @@ rdmetal_direct_resource_hold_for_import(struct pipe_resource *resource)
    while (node && &node->base != resource)
       node = node->next;
    uint64_t cost = node ? import_cost(node) : 0;
-   bool held = node && !node->pending_fd_import &&
+   bool held = node && !rdmetal_direct_depth_format_supported(node->base.format) &&
+               !node->pending_fd_import &&
                rdmetal_pending_imports < RDMETAL_MAX_PENDING_IMPORTS &&
                cost <= RDMETAL_MAX_PENDING_BYTES - rdmetal_pending_bytes;
    if (held) {
@@ -256,9 +270,19 @@ void rdmetal_direct_resource_release_pending_screen(struct pipe_screen *screen)
 long
 rdmetal_direct_resource_clear(struct pipe_resource *resource,uint64_t rgba16)
 {
-   if (!resource||!rdmetal_direct_resource_owns(resource)) return 0;
+   if (!resource||!rdmetal_direct_resource_owns(resource)||
+       rdmetal_direct_resource_is_depth(resource)) return 0;
    struct rdmetal_direct_resource *res=(struct rdmetal_direct_resource *)resource;
    return res->clear(res->broker_handle,rgba16);
+}
+
+long rdmetal_direct_resource_clear_depth(struct pipe_resource *resource,
+                                          float depth, unsigned stencil,
+                                          unsigned mask)
+{
+   if (!rdmetal_direct_resource_is_depth(resource)) return 0;
+   struct rdmetal_direct_resource *res = (void *)resource;
+   return res->clear_depth ? res->clear_depth(res->broker_handle, depth, stencil, mask) : 0;
 }
 
 static uint16_t rdmetal_unorm16(float value)
@@ -290,6 +314,11 @@ int
 rdmetal_direct_resource_upload(struct pipe_resource *resource,
                                const void *pixels, size_t bytes)
 {
+   if (resource && resource->format==PIPE_FORMAT_A8_UNORM) {
+      if (bytes!=(size_t)resource->width0*resource->height0) return -EINVAL;
+      return rdmetal_direct_resource_upload_region(resource,pixels,0,0,
+                resource->width0,resource->height0,resource->width0);
+   }
    if (!resource || !pixels || !rdmetal_direct_resource_owns(resource) ||
        resource->width0 > 4096 || resource->height0 > 4096 ||
        (uint64_t)resource->width0 * resource->height0 * 4 != bytes)
@@ -317,7 +346,22 @@ int rdmetal_direct_resource_upload_region(struct pipe_resource *resource,
    if (!resource || !pixels || !rdmetal_direct_resource_owns(resource) ||
        !width || !height || x > resource->width0 || y > resource->height0 ||
        width > resource->width0-x || height > resource->height0-y ||
-       stride < (uint64_t)width*4) return -EINVAL;
+       stride < (uint64_t)width*(resource->format==PIPE_FORMAT_A8_UNORM ? 1u : 4u)) return -EINVAL;
+   if (resource->format==PIPE_FORMAT_A8_UNORM) {
+      size_t bytes=(size_t)width*height*4;
+      uint8_t *rgba=calloc(1,bytes);
+      if (!rgba) return -ENOMEM;
+      const uint8_t *src=pixels;
+      for (uint32_t row=0;row<height;++row)
+         for (uint32_t col=0;col<width;++col)
+            rgba[((size_t)row*width+col)*4+3]=src[(size_t)row*stride+col];
+      long result=syscall(0x2002L,15L,rdmetal_direct_resource_handle(resource),
+          (long)rgba,(long)(((uint64_t)x<<32)|y),
+          (long)(((uint64_t)width<<32)|height),
+          (long)(((uint64_t)2<<32)|(width*4u)));
+      free(rgba);
+      return result==0 ? 0 : result==-1 ? -errno : -EIO;
+   }
    uint32_t format;
    switch (resource->format) {
    case PIPE_FORMAT_B8G8R8A8_UNORM: format = 1; break;

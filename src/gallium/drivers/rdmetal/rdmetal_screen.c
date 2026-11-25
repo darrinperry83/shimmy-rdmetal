@@ -25,6 +25,18 @@
 static atomic_uint rdmetal_clears;
 static atomic_uint rdmetal_resources;
 static bool rdmetal_direct_mode;
+static long rdmetal_broker_create_depth(unsigned width, unsigned height)
+{
+   return syscall(0x2002L, 17L, (long)width, (long)height, 0L, 0L, 0L);
+}
+static long rdmetal_broker_clear_depth(long handle, float depth,
+                                       unsigned stencil, unsigned mask)
+{
+   uint32_t bits;
+   memcpy(&bits, &depth, sizeof bits);
+   return syscall(0x2002L, 16L, handle, (long)bits, (long)stencil, (long)mask, 0L);
+}
+
 static const struct rdmetal_direct_ops rdmetal_broker_ops;
 /* EGL probes and destroys multiple screens while negotiating a context. A
  * process-global fallback pointer lets an old screen's destroy tear down a
@@ -180,7 +192,8 @@ rdmetal_broker_wait(long handle, long fence)
 
 static const struct rdmetal_direct_ops rdmetal_broker_ops = {
    rdmetal_broker_create, rdmetal_broker_clear,
-   rdmetal_broker_wait, rdmetal_broker_release
+   rdmetal_broker_wait, rdmetal_broker_release,
+   rdmetal_broker_create_depth, rdmetal_broker_clear_depth
 };
 
 /* Isolated ordinary-EGL callback probe. This mock never performs GPU work and
@@ -200,7 +213,7 @@ static int rdmetal_mock_release(long handle)
 { return handle == 1 ? 0 : -1; }
 static const struct rdmetal_direct_ops rdmetal_mock_ops = {
    rdmetal_mock_create, rdmetal_mock_clear,
-   rdmetal_mock_wait, rdmetal_mock_release
+   rdmetal_mock_wait, rdmetal_mock_release, NULL, NULL
 };
 
 /* A foreign dma-buf arrives as a single-plane, tightly packed BGRA8 IOSurface
@@ -318,6 +331,9 @@ rdmetal_resource_create(struct pipe_screen *screen,
    if (rdmetal_direct_mode && templ->target == PIPE_BUFFER)
       return rdmetal_cpu_buffer_create(screen, templ);
    if (rdmetal_direct_mode) {
+      if (rdmetal_direct_depth_format_supported(templ->format) &&
+          (templ->bind & PIPE_BIND_DEPTH_STENCIL))
+         return rdmetal_direct_resource_create(screen, templ, &rdmetal_broker_ops);
       /* st/mesa gives both an ordinary uploaded RGBA8 texture and an FBO
        * colour attachment bind=SAMPLER_VIEW|RENDER_TARGET. They must share a
        * resource representation: a sampled-only allocation cannot become a
@@ -332,9 +348,8 @@ rdmetal_resource_create(struct pipe_screen *screen,
           templ->width0 <= 4096 && templ->height0 <= 4096)
          return rdmetal_direct_resource_create(screen, templ,
             getenv("RDMETAL_MOCK_BROKER") ? &rdmetal_mock_ops : &rdmetal_broker_ops);
-      /* The broker-backed target only allocates 8-bit color surfaces.  Let
-       * softpipe allocate anything else the state tracker still asks for
-       * (depth/stencil) so the EGL/dri frontend's zsbuf invariant holds. */
+      /* Unsupported formats remain softpipe-owned. Mixed native/software
+       * framebuffer attachments are rejected by framebuffer routing. */
       return softpipe_resource_create_cb(screen, templ);
    }
    struct pipe_resource *res = softpipe_resource_create_cb(screen, templ);

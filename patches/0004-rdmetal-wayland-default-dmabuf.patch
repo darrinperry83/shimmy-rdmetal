@@ -15,8 +15,8 @@
      * broker image again. The signed consumer ack/rearm path is not wired yet.
      * Reject an already-presented slot before any attach/commit can repeat it. */
 -   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND") &&
-+   if (dri2_dpy->driver_name &&
-+       !strcmp(dri2_dpy->driver_name, "rdmetal") &&
++   if (getenv("RDMETAL_REQUIRE_DIRECT_WAYLAND") &&
++       !getenv("RDMETAL_USE_DMABUF") &&
         dri2_surf->back && dri2_surf->back->wl_buffer)
        return _eglError(EGL_BAD_ACCESS,"rdmetal frame awaits broker rearm");
  #endif

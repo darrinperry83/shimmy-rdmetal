@@ -12,6 +12,9 @@ void rdmetal_shader_delete(void *shader);
 const uint32_t *rdmetal_shader_words(const void *shader,
                                     enum pipe_shader_type expected_stage,
                                     size_t *count);
+const uint32_t *rdmetal_shader_fallback_words(const void *shader,
+                                             enum pipe_shader_type stage,
+                                             size_t *count);
 /* True when the synthetic pipeline for this stage samples a broker texture
  * (the forwarded texcoord varying + texture slot 0). */
 bool rdmetal_shader_textured(const void *shader,

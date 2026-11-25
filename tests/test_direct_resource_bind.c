@@ -21,7 +21,11 @@ static int waitf(long handle, long fence)
 }
 static unsigned releases;
 static int release(long handle)
-{ if (handle != 17) return -1; releases++; return 0; }
+{ if (handle != 17 && handle != 18) return -1; releases++; return 0; }
+
+static long create_depth(unsigned w, unsigned h) { return w==16 && h==16 ? 18 : 0; }
+static long clear_depth(long handle, float depth, unsigned stencil, unsigned mask)
+{ return handle==18 && depth==0.25f && stencil==7 && mask==3 ? 99 : 0; }
 
 /* pipe_resource_reference() includes this diagnostic callback. The test only
  * links rdmetal_direct_resource.c, without the rest of Mesa's util library. */
@@ -35,7 +39,7 @@ int main(void)
 {
    struct pipe_screen screen = {0};
    struct pipe_resource spec = {0};
-   const struct rdmetal_direct_ops ops = {create, clear, waitf, release};
+   const struct rdmetal_direct_ops ops = {create, clear, waitf, release, create_depth, clear_depth};
    spec.target = PIPE_TEXTURE_2D;
    spec.format = PIPE_FORMAT_R8G8B8A8_UNORM;
    spec.width0 = 2784;
@@ -91,6 +95,20 @@ int main(void)
    spec.bind = PIPE_BIND_RENDER_TARGET;
    assert(!rdmetal_direct_resource_adopt(&other_screen, &spec, &ops, 17));
    rdmetal_direct_resource_destroy(foreign);
+   spec.format = PIPE_FORMAT_Z24_UNORM_S8_UINT;
+   spec.bind = PIPE_BIND_DEPTH_STENCIL;
+   spec.width0 = spec.height0 = 16;
+   struct pipe_resource *z = rdmetal_direct_resource_create(&screen, &spec, &ops);
+   assert(z && rdmetal_direct_resource_is_depth(z));
+   assert(rdmetal_direct_resource_handle(z) == 18);
+   assert(rdmetal_direct_resource_clear_depth(z, 0.25f, 7, 3) == 99);
+   assert(rdmetal_direct_resource_clear(z, 0) == 0);
+   assert(!rdmetal_direct_resource_hold_for_import(z));
+   struct rdmetal_image_export_v1 exported = {0};
+   assert(!rdmetal_direct_resource_export(z, &exported));
+   unsigned depth_releases = releases;
+   rdmetal_direct_resource_destroy(z);
+   assert(releases == depth_releases + 1 && !rdmetal_direct_resource_owns(z));
    puts("direct RGBA8 accepts sample, render, and combined binds");
    return 0;
 }
